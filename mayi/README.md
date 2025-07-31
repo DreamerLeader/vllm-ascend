@@ -47,7 +47,6 @@ export GLOO_SOCKET_IFNAME="xxxxxx"
 export TP_SOCKET_IFNAME="xxxxxx"
 export HCCL_SOCKET_IFNAME="xxxxxx"
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
-export VLLM_LLMDD_CHANNEL_PORT=15272
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=100
 export MOONCAKE_CONFIG_PATH="/xxxxx/mooncake.json"
@@ -64,10 +63,8 @@ vllm serve "/xxxxx/DeepSeek-V2-Lite-Chat" \
   --trust-remote-code \
   --enforce-eager \
   --data-parallel-size 2 \
-  --data-parallel-size-local 2 \
   --data-parallel-address localhost \
   --data-parallel-rpc-port 9100 \
-  --data-parallel-start-rank 0 \
   --gpu-memory-utilization 0.8  \
   --kv-transfer-config  \
   '{"kv_connector": "MooncakeConnectorV1",
@@ -90,27 +87,25 @@ vllm serve "/xxxxx/DeepSeek-V2-Lite-Chat" \
       }
   }'  \
 ```
-HCCL_EXEC_TIMEOUT、HCCL_CONNECT_TIMEOUT、HCCL_IF_IP为hccl相关配置<br>
-GLOO_SOCKET_IFNAME、TP_SOCKET_IFNAME、HCCL_SOCKET_IFNAME配置为对应网卡<br>
-ASCEND_RT_VISIBLE_DEVICES指定节点运行在哪些卡上，卡总数等于dp*tp<br>
-VLLM_LLMDD_CHANNEL_PORT指定节点运行的port需要与mooncake.json中节点的port对应<br>
-OMP_PROC_BIND、OMP_NUM_THREADS默认配置<br>
-MOONCAKE_CONFIG_PATH指定mooncake.json的路径<br>
-VLLM_USE_V1配置为1<br>
-VLLM_BASE_PORT配置vllm的基础port<br>
-/xxxxx/DeepSeek-V2-Lite-Chat配置为需要运行的模型<br>
---host配置为拉起节点所在ip<br>
---port配置拉起的port，与步骤4中的port对应<br>
---seed、--max-model-len、--max-num-batched-tokens模型基础配置，按照实际场景配置<br>
---tensor-parallel-size：配置tp的size<br>
---data-parallel-size：配置dp的size<br>
---data-parallel-size-local：和dpsize一致<br>
---data-parallel-address：dp的ip，配置为节点所在ip--data-parallel-rpc-port：dp分组中通信的rpc port<br>
---data-parallel-start-rank：配置dp开始的第一张卡，ASCEND_RT_VISIBLE_DEVICES配置的第一张卡<br>
---trust-remote-code能够加载自己本地的模型<br>
---enforce-eager不开图模式<br>
---gpu-memory-utilization占用卡的显存比例<br>
---kv-transfer-config：关注kv_connector、kv_connector_module_path按脚本中的配置使用mooncakeconnect，kv_buffer_device指定运行在npu卡上，kv_role配置kv_producer为p节点，配置kv_consumer为d节点，kv_parallel_size并行配置默认为1，kv_port节点连接使用的port，对于p节点engine_id、kv_rank配置为0，d节点配置为1；kv_connector_extra_config中配置p、d节点的分布式并行策略，按照上面--tensor-parallel-size与--data-parallel-size配置<br>
+`HCCL_EXEC_TIMEOUT`、`HCCL_CONNECT_TIMEOUT`、`HCCL_IF_IP`为hccl相关配置<br>
+`GLOO_SOCKET_IFNAME`、`TP_SOCKET_IFNAME`、`HCCL_SOCKET_IFNAME`配置为对应网卡<br>
+`ASCEND_RT_VISIBLE_DEVICES`指定节点运行在哪些卡上，卡总数等于dp*tp<br>
+`OMP_PROC_BIND`、`OMP_NUM_THREADS`默认配置<br>
+`MOONCAKE_CONFIG_PATH`指定mooncake.json的路径<br>
+`VLLM_USE_V1`配置为1<br>
+`VLLM_BASE_PORT`配置vllm的基础port<br>
+`/xxxxx/DeepSeek-V2-Lite-Chat`配置为需要运行的模型<br>
+`--host`配置为拉起节点所在ip<br>
+`--port`配置拉起的port，与步骤4中的port对应<br>
+`--seed`、`--max-model-len`、`--max-num-batched-tokens`模型基础配置，按照实际场景配置<br>
+`--tensor-parallel-size`：配置tp的size<br>
+`--data-parallel-size`：配置dp的size<br>
+`--data-parallel-address`：dp的ip，配置为节点所在ip<br>
+`--data-parallel-rpc-port`：dp分组中通信的rpc port<br>
+`--trust-remote-code`能够加载自己本地的模型<br>
+`--enforce-eager`不开图模式<br>
+`--gpu-memory-utilization`占用卡的显存比例<br>
+`--kv-transfer-config`：关注kv_connector、kv_connector_module_path按脚本中的配置使用mooncakeconnect，kv_buffer_device指定运行在npu卡上，kv_role配置kv_producer为p节点，配置kv_consumer为d节点，kv_parallel_size并行配置默认为1，kv_port节点连接使用的port，对于p节点engine_id、kv_rank配置为0，d节点配置为1；kv_connector_extra_config中配置p、d节点的分布式并行策略，按照上面--tensor-parallel-size与--data-parallel-size配置<br>
 
 ### 3、拉起`decode`节点
 
@@ -128,7 +123,6 @@ export GLOO_SOCKET_IFNAME="xxxxxx"
 export TP_SOCKET_IFNAME="xxxxxx"
 export HCCL_SOCKET_IFNAME="xxxxxx"
 export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7
-export VLLM_LLMDD_CHANNEL_PORT=14012
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=100
 export MOONCAKE_CONFIG_PATH="/xxxxx/mooncake.json"
@@ -145,10 +139,8 @@ vllm serve "/xxxxx/DeepSeek-V2-Lite-Chat" \
   --trust-remote-code \
   --enforce-eager \
   --data-parallel-size 2 \
-  --data-parallel-size-local 2 \
   --data-parallel-address localhost \
   --data-parallel-rpc-port 9100 \
-  --data-parallel-start-rank 4 \
   --gpu-memory-utilization 0.8  \
   --kv-transfer-config  \
   '{"kv_connector": "MooncakeConnectorV1",
@@ -190,11 +182,11 @@ python toy_proxy_server.py \
     --decoder-ports 8200 8201 \
 ```
 
---host：为主节点，步骤5中的curl命令下发中的localhost与该host保持一致，拉起服务代理端口默认8000<br>
---prefiller-hosts：配置为所有p节点的ip，对于xpyd的场景，依次将ip写在该配置后面，ip与ip之间空一格<br>
---prefiller-ports：配置为所有p节点的port，也是步骤3中vllm拉起服务--port的配置， 依次将port写在该配置后面，port与port之间空一格，且顺序要保证和--prefiller-hosts的ip一一对应<br>
---decoder-hosts：配置为所有d节点的ip，对于xpyd的场景，依次将ip写在该配置后面，ip与ip之间空一格<br>
---decoder-ports：配置为所有d节点的port，也是步骤4中vllm拉起服务--port的配置， 依次将port写在该配置后面，port与port之间空一格，且顺序要保证和--decoder-hosts的ip一一对应<br>
+`--host`：为主节点，步骤5中的curl命令下发中的localhost与该host保持一致，拉起服务代理端口默认8000<br>
+`--prefiller-hosts`：配置为所有p节点的ip，对于xpyd的场景，依次将ip写在该配置后面，ip与ip之间空一格<br>
+`--prefiller-ports`：配置为所有p节点的port，也是步骤3中vllm拉起服务--port的配置， 依次将port写在该配置后面，port与port之间空一格，且顺序要保证和--prefiller-hosts的ip一一对应<br>
+`--decoder-hosts`：配置为所有d节点的ip，对于xpyd的场景，依次将ip写在该配置后面，ip与ip之间空一格<br>
+`--decoder-ports`：配置为所有d节点的port，也是步骤4中vllm拉起服务--port的配置， 依次将port写在该配置后面，port与port之间空一格，且顺序要保证和--decoder-hosts的ip一一对应<br>
 
 ### 5、推理任务下发
 
