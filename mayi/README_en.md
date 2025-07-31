@@ -103,9 +103,7 @@ Set `VLLM_USE_V1` to 1.<br>
 `--seed`, --max-model-len, and --max-num-batched-tokens model basic configuration. Set this parameter based on the site requirements.<br>
 `--tensor-parallel-size`: specifies the TP size.<br>
 `--data-parallel-size`: indicates the DP size.<br>
-`--data-parallel-size-local`: Same as dpsize.<br>
 `--data-parallel-address`: indicates the IP address of the DP. Set this parameter to the IP address of the node.--data-parallel-rpc-port: indicates the RPC port for communication in the DP group.<br>
-`--data-parallel-start-rank`: indicates the first card that starts from DP and is the first card that is configured by ASCEND_RT_VISIBLE_DEVICES.<br>
 `--trust-remote-code` can load the local model.<br>
 `--enforce-eager` Turn off the map mode<br>
 `--gpu-memory-utilization`: Percentage of video memory occupied by the card<br>
