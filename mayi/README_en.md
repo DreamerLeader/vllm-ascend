@@ -1,4 +1,4 @@
-# mooncakeconnector V1 run Guide #
+# mooncakeconnector V1 Guide #
 
 ## Environmental Requirements ##
 
@@ -7,7 +7,7 @@
      *  Python >= 3.9, < 3.12
      *  CANN >= 8.2.rc1
      *  PyTorch >= 2.5.1, torch-npu >= 2.5.1.post1.dev20250619
-     *  v LLM (same version as vllm-ascend)
+     *  vLLM (same version as vllm-ascend)
 
 The vllm version must be the same as the main branch of vllm-ascend, for example, 2025/07/30. The version is
 
@@ -93,7 +93,7 @@ vllm serve "/xxxxx/DeepSeek-V2-Lite-Chat" \
   }'  \
 ```
 
-HCCL_EXEC_TIMEOUT, HCCL_CONNECT_TIMEOUT, and HCCL_IF_IP are hccl-related configurations.<br>
+‘HCCL_EXEC_TIMEOUT’, HCCL_CONNECT_TIMEOUT, and HCCL_IF_IP are hccl-related configurations.<br>
 Set GLOO_SOCKET_IFNAME, TP_SOCKET_IFNAME, and HCCL_SOCKET_IFNAME to the corresponding NIC.<br>
 ASCEND_RT_VISIBLE_DEVICES specifies the cards on which the node run resides. The total number of cards equals dp x tp.<br>
 V LLM_LLMDD_CHANNEL_PORT The port number of the run node must be the same as the port number of the node in the mooncake.json file.<br>
