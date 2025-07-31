@@ -46,7 +46,7 @@ export HCCL_IF_IP=localhost
 export GLOO_SOCKET_IFNAME="xxxxxx"
 export TP_SOCKET_IFNAME="xxxxxx"
 export HCCL_SOCKET_IFNAME="xxxxxx"
-export ASCEND_RT_VISIBLE_DEVICES=0
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
 export VLLM_LLMDD_CHANNEL_PORT=15272
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=100
@@ -57,12 +57,17 @@ export VLLM_BASE_PORT=9700
 vllm serve "/xxxxx/DeepSeek-V2-Lite-Chat" \
   --host localhost \
   --port 8100 \
-  --tensor-parallel-size 1\
+  --tensor-parallel-size 2\
   --seed 1024 \
   --max-model-len 2000  \
   --max-num-batched-tokens 2000  \
   --trust-remote-code \
   --enforce-eager \
+  --data-parallel-size 2 \
+  --data-parallel-size-local 2 \
+  --data-parallel-address localhost \
+  --data-parallel-rpc-port 9100 \
+  --data-parallel-start-rank 0 \
   --gpu-memory-utilization 0.8  \
   --kv-transfer-config  \
   '{"kv_connector": "MooncakeConnectorV1",
@@ -75,12 +80,12 @@ vllm serve "/xxxxx/DeepSeek-V2-Lite-Chat" \
   "kv_connector_module_path": "vllm_ascend.distributed.mooncake_connector",
   "kv_connector_extra_config": {
             "prefill": {
-                    "dp_size": 1,
-                    "tp_size": 1
+                    "dp_size": 2,
+                    "tp_size": 2
              },
              "decode": {
-                    "dp_size": 1,
-                    "tp_size": 1
+                    "dp_size": 2,
+                    "tp_size": 2
              }
       }
   }'  \
@@ -92,7 +97,7 @@ vllm serve "/xxxxx/DeepSeek-V2-Lite-Chat" \
 bash run_decode.sh
 ```
 
-run_prefill.sh脚本内容
+run_decode.sh脚本内容
 
 ```bash
 export HCCL_EXEC_TIMEOUT=204
@@ -101,8 +106,8 @@ export HCCL_IF_IP=localhost
 export GLOO_SOCKET_IFNAME="xxxxxx"
 export TP_SOCKET_IFNAME="xxxxxx"
 export HCCL_SOCKET_IFNAME="xxxxxx"
-export ASCEND_RT_VISIBLE_DEVICES=0
-export VLLM_LLMDD_CHANNEL_PORT=15272
+export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7
+export VLLM_LLMDD_CHANNEL_PORT=14012
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=100
 export MOONCAKE_CONFIG_PATH="/xxxxx/mooncake.json"
@@ -111,31 +116,36 @@ export VLLM_BASE_PORT=9700
 
 vllm serve "/xxxxx/DeepSeek-V2-Lite-Chat" \
   --host localhost \
-  --port 8100 \
-  --tensor-parallel-size 1\
+  --port 8200 \
+  --tensor-parallel-size 2\
   --seed 1024 \
   --max-model-len 2000  \
   --max-num-batched-tokens 2000  \
   --trust-remote-code \
   --enforce-eager \
+  --data-parallel-size 2 \
+  --data-parallel-size-local 2 \
+  --data-parallel-address localhost \
+  --data-parallel-rpc-port 9100 \
+  --data-parallel-start-rank 4 \
   --gpu-memory-utilization 0.8  \
   --kv-transfer-config  \
   '{"kv_connector": "MooncakeConnectorV1",
   "kv_buffer_device": "npu",
-  "kv_role": "kv_producer",
+  "kv_role": "kv_consumer",
   "kv_parallel_size": 1,
-  "kv_port": "20001",
-  "engine_id": "0",
-  "kv_rank": 0,
+  "kv_port": "20002",
+  "engine_id": "1",
+  "kv_rank": 1,
   "kv_connector_module_path": "vllm_ascend.distributed.mooncake_connector",
   "kv_connector_extra_config": {
             "prefill": {
-                    "dp_size": 1,
-                    "tp_size": 1
+                    "dp_size": 2,
+                    "tp_size": 2
              },
              "decode": {
-                    "dp_size": 1,
-                    "tp_size": 1
+                    "dp_size": 2,
+                    "tp_size": 2
              }
       }
   }'  \
