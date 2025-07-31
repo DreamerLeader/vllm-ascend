@@ -90,6 +90,27 @@ vllm serve "/xxxxx/DeepSeek-V2-Lite-Chat" \
       }
   }'  \
 ```
+HCCL_EXEC_TIMEOUT、HCCL_CONNECT_TIMEOUT、HCCL_IF_IP为hccl相关配置<br>
+GLOO_SOCKET_IFNAME、TP_SOCKET_IFNAME、HCCL_SOCKET_IFNAME配置为对应网卡<br>
+ASCEND_RT_VISIBLE_DEVICES指定节点运行在哪些卡上，卡总数等于dp*tp<br>
+VLLM_LLMDD_CHANNEL_PORT指定节点运行的port需要与mooncake.json中节点的port对应<br>
+OMP_PROC_BIND、OMP_NUM_THREADS默认配置<br>
+MOONCAKE_CONFIG_PATH指定mooncake.json的路径<br>
+VLLM_USE_V1配置为1<br>
+VLLM_BASE_PORT配置vllm的基础port<br>
+/xxxxx/DeepSeek-V2-Lite-Chat配置为需要运行的模型<br>
+--host配置为拉起节点所在ip<br>
+--port配置拉起的port，与步骤4中的port对应<br>
+--seed、--max-model-len、--max-num-batched-tokens模型基础配置，按照实际场景配置<br>
+--tensor-parallel-size：配置tp的size<br>
+--data-parallel-size：配置dp的size<br>
+--data-parallel-size-local：和dpsize一致<br>
+--data-parallel-address：dp的ip，配置为节点所在ip--data-parallel-rpc-port：dp分组中通信的rpc port<br>
+--data-parallel-start-rank：配置dp开始的第一张卡，ASCEND_RT_VISIBLE_DEVICES配置的第一张卡<br>
+--trust-remote-code能够加载自己本地的模型<br>
+--enforce-eager不开图模式<br>
+--gpu-memory-utilization占用卡的显存比例<br>
+--kv-transfer-config：关注kv_connector、kv_connector_module_path按脚本中的配置使用mooncakeconnect，kv_buffer_device指定运行在npu卡上，kv_role配置kv_producer为p节点，配置kv_consumer为d节点，kv_parallel_size并行配置默认为1，kv_port节点连接使用的port，对于p节点engine_id、kv_rank配置为0，d节点配置为1；kv_connector_extra_config中配置p、d节点的分布式并行策略，按照上面--tensor-parallel-size与--data-parallel-size配置<br>
 
 ### 3、拉起`decode`节点
 
