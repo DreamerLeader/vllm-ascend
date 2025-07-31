@@ -7,7 +7,7 @@
      *  Python >= 3.9, < 3.12
      *  CANN >= 8.2.rc1
      *  PyTorch >= 2.5.1, torch-npu >= 2.5.1.post1.dev20250619
-     *  VLLM (same version as vllm-ascend)
+     *  vLLM (same version as vllm-ascend)
 
 The vllm version must be the same as the main branch of vllm-ascend, for example, 2025/07/30. The version is
 
@@ -96,7 +96,7 @@ Set `GLOO_SOCKET_IFNAME`, `TP_SOCKET_IFNAME`, and `HCCL_SOCKET_IFNAME` to the co
 Default configuration of `OMP_PROC_BIND` and `OMP_NUM_THREADS`<br>
 `BUDGET_CONFIG_PATH` specifies the path of the mooncake.json file.<br>
 Set `VLLM_USE_V1` to 1.<br>
-`VLLM_BASE_PORT` Configuring the Basic Port of the VLLM<br>
+`VLLM_BASE_PORT` Configuring the Basic Port of the vLLM<br>
 `/xxxxx/DeepSeek-V2-Lite-Chat` is configured as a model that requires run.<br>
 `--host`: indicates the IP address of the node to be started.<br>
 `--port`: indicates the port to be started, which corresponds to the port in step 4.<br>
