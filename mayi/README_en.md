@@ -1,22 +1,22 @@
-# mooncakeconnector V1 Guide #
+# Mooncakeconnector V1 deployment Guide
 
-## Environmental Requirements ##
+## Environmental Requirements
 
  *  Software:
     
      *  Python >= 3.9, < 3.12
      *  CANN >= 8.2.rc1
      *  PyTorch >= 2.5.1, torch-npu >= 2.5.1.post1.dev20250619
-     *  vLLM (same version as vllm-ascend)
+     *  VLLM (same version as vllm-ascend)
 
 The vllm version must be the same as the main branch of vllm-ascend, for example, 2025/07/30. The version is
 
  *  vllm: v0.10.0
- *  vllm-ascend: main branch
+ *  vllm-ascend: main branch ( as of 25/07/30)
 
-## run ##
+## run
 
-### 1. Configure mooncake.json. ###
+### 1. Configure mooncake.json
 
 ```
 {
@@ -33,7 +33,7 @@ The vllm version must be the same as the main branch of vllm-ascend, for example
 "protocol": Configure the HCCL communication mode. Configure the ascending mode to use the HCCL communication mode.<br>
 
 
-### 2. Pull up`prefill`Node ###
+### 2.Run `prefill` Node
 
 ```
 bash run_prefill.sh
@@ -49,7 +49,6 @@ export GLOO_SOCKET_IFNAME="xxxxxx"
 export TP_SOCKET_IFNAME="xxxxxx"
 export HCCL_SOCKET_IFNAME="xxxxxx"
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
-export VLLM_LLMDD_CHANNEL_PORT=15272
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=100
 export MOONCAKE_CONFIG_PATH="/xxxxx/mooncake.json"
@@ -66,10 +65,8 @@ vllm serve "/xxxxx/DeepSeek-V2-Lite-Chat" \
   --trust-remote-code \
   --enforce-eager \
   --data-parallel-size 2 \
-  --data-parallel-size-local 2 \
   --data-parallel-address localhost \
   --data-parallel-rpc-port 9100 \
-  --data-parallel-start-rank 0 \
   --gpu-memory-utilization 0.8  \
   --kv-transfer-config  \
   '{"kv_connector": "MooncakeConnectorV1",
@@ -93,30 +90,29 @@ vllm serve "/xxxxx/DeepSeek-V2-Lite-Chat" \
   }'  \
 ```
 
-‘HCCL_EXEC_TIMEOUT’, HCCL_CONNECT_TIMEOUT, and HCCL_IF_IP are hccl-related configurations.<br>
-Set GLOO_SOCKET_IFNAME, TP_SOCKET_IFNAME, and HCCL_SOCKET_IFNAME to the corresponding NIC.<br>
-ASCEND_RT_VISIBLE_DEVICES specifies the cards on which the node run resides. The total number of cards equals dp x tp.<br>
-V LLM_LLMDD_CHANNEL_PORT The port number of the run node must be the same as the port number of the node in the mooncake.json file.<br>
-Default configuration of OMP_PROC_BIND and OMP_NUM_THREADS<br>
-BUDGET_CONFIG_PATH specifies the path of the mooncake.json file.<br>
-Set V LLM_USE_V1 to 1.<br>
-V LLM_BASE_PORT Configuring the Basic Port of the VLM<br>
-/xxxxx/DeepSeek-V2-Lite-Chat is configured as a model that requires run.<br>
-\--host: indicates the IP address of the node to be started.<br>
-\--port: indicates the port to be started, which corresponds to the port in step 4.<br>
-\--seed, --max-model-len, and --max-num-batched-tokens model basic configuration. Set this parameter based on the site requirements.<br>
-\--tensor-parallel-size: specifies the TP size.<br>
-\--data-parallel-size: indicates the DP size.<br>
-\--data-parallel-size-local: Same as dpsize.<br>
-\--data-parallel-address: indicates the IP address of the DP. Set this parameter to the IP address of the node.--data-parallel-rpc-port: indicates the RPC port for communication in the DP group.<br>
-\--data-parallel-start-rank: indicates the first card that starts from DP and is the first card that is configured by ASCEND_RT_VISIBLE_DEVICES.<br>
-\--trust-remote-code can load the local model.<br>
-\--enforce-eager Turn off the map mode<br>
-\--gpu-memory-utilization: Percentage of video memory occupied by the card<br>
-\--kv-transfer-config: follow kv_connector, kv_connector_module_path: mooncakeconnect, kv_buffer_device, and run on the NPU card. For kv_role, set kv_producer to the p node, kv_consumer to the d node, kv_parallel_size to 1, and kv_port to the port used by the node. For the p node, set engine_id and kv_rank to 0 and for the d node to 1. Configure the distributed parallel policy for the p and d nodes in the kv_connector_extra_config file based on --tensor-parallel-size and --data-parallel-size.<br>
+`HCCL_EXEC_TIMEOUT`, `HCCL_CONNECT_TIMEOUT`, and `HCCL_IF_IP` are hccl-related configurations.<br>
+Set `GLOO_SOCKET_IFNAME`, `TP_SOCKET_IFNAME`, and `HCCL_SOCKET_IFNAME` to the corresponding NIC.<br>
+`ASCEND_RT_VISIBLE_DEVICES` specifies the cards on which the node run resides. The total number of cards equals `dp_size*tp_size`.<br>
+Default configuration of `OMP_PROC_BIND` and `OMP_NUM_THREADS`<br>
+`BUDGET_CONFIG_PATH` specifies the path of the mooncake.json file.<br>
+Set `VLLM_USE_V1` to 1.<br>
+`VLLM_BASE_PORT` Configuring the Basic Port of the VLLM<br>
+`/xxxxx/DeepSeek-V2-Lite-Chat` is configured as a model that requires run.<br>
+`--host`: indicates the IP address of the node to be started.<br>
+`--port`: indicates the port to be started, which corresponds to the port in step 4.<br>
+`--seed`, --max-model-len, and --max-num-batched-tokens model basic configuration. Set this parameter based on the site requirements.<br>
+`--tensor-parallel-size`: specifies the TP size.<br>
+`--data-parallel-size`: indicates the DP size.<br>
+`--data-parallel-size-local`: Same as dpsize.<br>
+`--data-parallel-address`: indicates the IP address of the DP. Set this parameter to the IP address of the node.--data-parallel-rpc-port: indicates the RPC port for communication in the DP group.<br>
+`--data-parallel-start-rank`: indicates the first card that starts from DP and is the first card that is configured by ASCEND_RT_VISIBLE_DEVICES.<br>
+`--trust-remote-code` can load the local model.<br>
+`--enforce-eager` Turn off the map mode<br>
+`--gpu-memory-utilization`: Percentage of video memory occupied by the card<br>
+`--kv-transfer-config`: follow kv_connector, kv_connector_module_path: mooncakeconnect, kv_buffer_device, and run on the NPU card. For kv_role, set kv_producer to the p node, kv_consumer to the d node, kv_parallel_size to 1, and kv_port to the port used by the node. For the p node, set engine_id and kv_rank to 0 and for the d node to 1. Configure the distributed parallel policy for the p and d nodes in the kv_connector_extra_config file based on --tensor-parallel-size and --data-parallel-size.<br>
 
 
-### 3. Pull up`decode`Node ###
+### 3. Run `decode` Node
 
 ```
 bash run_decode.sh
@@ -132,7 +128,6 @@ export GLOO_SOCKET_IFNAME="xxxxxx"
 export TP_SOCKET_IFNAME="xxxxxx"
 export HCCL_SOCKET_IFNAME="xxxxxx"
 export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7
-export VLLM_LLMDD_CHANNEL_PORT=14012
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=100
 export MOONCAKE_CONFIG_PATH="/xxxxx/mooncake.json"
@@ -149,10 +144,8 @@ vllm serve "/xxxxx/DeepSeek-V2-Lite-Chat" \
   --trust-remote-code \
   --enforce-eager \
   --data-parallel-size 2 \
-  --data-parallel-size-local 2 \
   --data-parallel-address localhost \
   --data-parallel-rpc-port 9100 \
-  --data-parallel-start-rank 4 \
   --gpu-memory-utilization 0.8  \
   --kv-transfer-config  \
   '{"kv_connector": "MooncakeConnectorV1",
@@ -194,14 +187,14 @@ python toy_proxy_server.py \
     --decoder-ports 8200 8201 \
 ```
 
-\--host: indicates the active node. The value of localhost in the curl command delivered in step 5 must be the same as the host. The default port number for starting the service proxy is 8000.<br>
-\--prefiller-hosts: Set this parameter to the IP addresses of all p nodes. In the xpyd scenario, add the IP addresses to the end of this configuration item and leave a blank space between the IP addresses.<br>
-\--prefiller-ports: Set this parameter to the port number of all p nodes, which is the configuration of the port number for the vllm to start the service in step 3. Write the port number after the configuration in sequence and leave a blank space between the port number and the port number. The sequence must be one-to-one mapping to the IP address of --prefiller-hosts.<br>
-\--decoder-hosts: Set this parameter to the IP addresses of all d nodes. In the xpyd scenario, add the IP addresses to the end of this configuration item and leave a blank space between the IP addresses.<br>
-\--decoder-ports: Set this parameter to the port number of all d nodes, which is the configuration of the port number for the vllm to start the service in step 4. Set port to the end of the configuration, and leave a blank space between port and port. The sequence must be one-to-one mapping to the IP address of --decoder-hosts.<br>
+`--host`: indicates the active node. The value of localhost in the curl command delivered in step 5 must be the same as the host. The default port number for starting the service proxy is 8000.<br>
+`--prefiller-hosts`: Set this parameter to the IP addresses of all p nodes. In the xpyd scenario, add the IP addresses to the end of this configuration item and leave a blank space between the IP addresses.<br>
+`--prefiller-ports`: Set this parameter to the port number of all p nodes, which is the configuration of the port number for the vllm to start the service in step 3. Write the port number after the configuration in sequence and leave a blank space between the port number and the port number. The sequence must be one-to-one mapping to the IP address of --prefiller-hosts.<br>
+`--decoder-hosts`: Set this parameter to the IP addresses of all d nodes. In the xpyd scenario, add the IP addresses to the end of this configuration item and leave a blank space between the IP addresses.<br>
+`--decoder-ports`: Set this parameter to the port number of all d nodes, which is the configuration of the port number for the vllm to start the service in step 4. Set port to the end of the configuration, and leave a blank space between port and port. The sequence must be one-to-one mapping to the IP address of --decoder-hosts.<br>
 
 
-### 5. inference job delivery ###
+### 5. Run Inference
 
 Set the IP address in the inference file to the actual IP address. Set the model variable to the path of the model. Ensure that the path is the same as that in the shell script.
 
