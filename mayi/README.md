@@ -26,10 +26,10 @@ vllm的版本要与vllm-ascend的main分支一致，2025/07/30，版本为
 }
 ```
 
-"prefill\_url": 配置prefill所在ip和prot,
-"decode\_url": 配置decode所在ip和prot",
-"metadata\_backend": 选http,
-"protocol": 配置hccl的通信, 配置ascend使用hccl的通信方式
+"prefill\_url": 配置prefill所在ip和prot,<br>
+"decode\_url": 配置decode所在ip和prot",<br>
+"metadata\_backend": 选http,<br>
+"protocol": 配置hccl的通信, 配置ascend使用hccl的通信方式<br>
 
 ### 2、拉起`prefill`节点
 
@@ -159,11 +159,11 @@ python toy_proxy_server.py \
     --decoder-ports 8200 8201 \
 ```
 
---host：为主节点，步骤5中的curl命令下发中的localhost与该host保持一致，拉起服务代理端口默认8000
---prefiller-hosts：配置为所有p节点的ip，对于xpyd的场景，依次将ip写在该配置后面，ip与ip之间空一格
---prefiller-ports：配置为所有p节点的port，也是步骤3中vllm拉起服务--port的配置， 依次将port写在该配置后面，port与port之间空一格，且顺序要保证和--prefiller-hosts的ip一一对应
---decoder-hosts：配置为所有d节点的ip，对于xpyd的场景，依次将ip写在该配置后面，ip与ip之间空一格
---decoder-ports：配置为所有d节点的port，也是步骤4中vllm拉起服务--port的配置， 依次将port写在该配置后面，port与port之间空一格，且顺序要保证和--decoder-hosts的ip一一对应
+--host：为主节点，步骤5中的curl命令下发中的localhost与该host保持一致，拉起服务代理端口默认8000<br>
+--prefiller-hosts：配置为所有p节点的ip，对于xpyd的场景，依次将ip写在该配置后面，ip与ip之间空一格<br>
+--prefiller-ports：配置为所有p节点的port，也是步骤3中vllm拉起服务--port的配置， 依次将port写在该配置后面，port与port之间空一格，且顺序要保证和--prefiller-hosts的ip一一对应<br>
+--decoder-hosts：配置为所有d节点的ip，对于xpyd的场景，依次将ip写在该配置后面，ip与ip之间空一格<br>
+--decoder-ports：配置为所有d节点的port，也是步骤4中vllm拉起服务--port的配置， 依次将port写在该配置后面，port与port之间空一格，且顺序要保证和--decoder-hosts的ip一一对应<br>
 
 ### 5、推理任务下发
 
