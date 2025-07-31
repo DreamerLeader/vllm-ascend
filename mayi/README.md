@@ -159,7 +159,7 @@ python toy_proxy_server.py \
     --decoder-ports 8200 8201 \
 ```
 
-host：为主节点，步骤5中的curl命令下发中的localhost与该host保持一致，拉起服务代理端口默认8000
+--host：为主节点，步骤5中的curl命令下发中的localhost与该host保持一致，拉起服务代理端口默认8000
 --prefiller-hosts：配置为所有p节点的ip，对于xpyd的场景，依次将ip写在该配置后面，ip与ip之间空一格
 --prefiller-ports：配置为所有p节点的port，也是步骤3中vllm拉起服务--port的配置， 依次将port写在该配置后面，port与port之间空一格，且顺序要保证和--prefiller-hosts的ip一一对应
 --decoder-hosts：配置为所有d节点的ip，对于xpyd的场景，依次将ip写在该配置后面，ip与ip之间空一格
