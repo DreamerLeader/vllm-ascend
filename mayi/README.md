@@ -11,7 +11,7 @@
 vllm的版本要与vllm-ascend的main分支一致，2025/07/30，版本为
 
 * vllm: v0.10.0
-* vllm-ascend: main分支
+* vllm-ascend: main分支 截止2025/07/30
 
 ## 运行
 
