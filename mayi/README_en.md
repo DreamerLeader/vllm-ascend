@@ -1,6 +1,6 @@
 # Mooncakeconnector V1 deployment Guide
 
-## Environmental Requirements
+## Environmental Dependencies
 
  *  Software:
     
