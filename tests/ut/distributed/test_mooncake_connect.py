@@ -658,32 +658,22 @@ class TestMainThreadLoop(unittest.TestCase):
         mock_handle.assert_called_once_with(test_request)
         self.assertTrue(self.thread.request_queue.empty())
 
-
 class MockVllmConfig:
     def __init__(self):
-        class MockCacheConfig:
-            block_size = 16
-        
-        class MockParallelConfig:
-            tensor_parallel_size = 2
-            data_parallel_size = 1
-            data_parallel_rank_local = 0
-        
-        class MockKVTransferConfig:
-            kv_port = 5000
-            engine_id = "test_engine"
-            kv_role = "kv_producer"
-            
-            def get_from_extra_config(self, key, default):
-                if key == "prefill":
-                    return {"tp_size": 4, "dp_size": 1}
-                elif key == "decode":
-                    return {"tp_size": 2, "dp_size": 1}
-                return default
-        
-        self.cache_config = MockCacheConfig()
-        self.parallel_config = MockParallelConfig()
-        self.kv_transfer_config = MockKVTransferConfig()
+        self.parallel_config = MagicMock()
+        self.cache_config = MagicMock()
+        self.kv_transfer_config = MagicMock()
+        self.parallel_config.tensor_parallel_size = 2
+        self.parallel_config.data_parallel_rank_local = 0 
+        self.parallel_config.data_parallel_size_local = 1
+        self.cache_config.block_size = 16
+        self.kv_transfer_config.kv_port = 5000
+        self.kv_transfer_config.kv_role = 'kv_producer'
+        self.kv_transfer_config.get_from_extra_config = MagicMock()
+        self.kv_transfer_config.get_from_extra_config.side_effect = lambda k, d: {
+            "prefill": {"tp_size": 2, "dp_size": 1},
+            "decode": {"tp_size": 2, "dp_size": 1}
+        }.get(k, d)
 
 
 class MockRequest:
@@ -791,8 +781,8 @@ class TestMooncakeConnectorSchedulerMatchedTokens(unittest.TestCase):
 
 class TestHelperFunctions(unittest.TestCase):
     def test_group_concurrent_contiguous(self):
-        src = [1, 2, 3, 5, 6]
-        dst = [10, 11, 12, 14, 15]
+        src: list[int] = [1, 2, 3, 5, 6]
+        dst: list[int] = [10, 11, 12, 14, 15]
         
         src_groups, dst_groups = group_concurrent_contiguous(src, dst)
         
@@ -803,8 +793,9 @@ class TestHelperFunctions(unittest.TestCase):
         self.assertEqual(dst_groups[1], [14, 15])
     
     def test_group_concurrent_contiguous_empty(self):
-        src = []
-        dst = []
+        
+        src: list[int] = []
+        dst: list[int] = []
         src_groups, dst_groups = group_concurrent_contiguous(src, dst)
         self.assertEqual(src_groups, [])
         self.assertEqual(dst_groups, [])
@@ -941,8 +932,8 @@ class TestUtils(unittest.TestCase):
         self.assertIsInstance(h1, int)
 
     def test_group_concurrent_contiguous(self):
-        src = [1, 2, 3, 5, 6]
-        dst = [10, 11, 12, 20, 21]
+        src: list[int] = [1, 2, 3, 5, 6]
+        dst: list[int] = [10, 11, 12, 20, 21]
         src_g, dst_g = group_concurrent_contiguous(src, dst)
         self.assertEqual(src_g, [[1, 2, 3], [5, 6]])
         self.assertEqual(dst_g, [[10, 11, 12], [20, 21]])
@@ -1046,25 +1037,6 @@ mock_envs_ascend.MOONCAKE_CONNECTOR_PROTOCOL = "mock_protocol"
 
 mock_logger = MagicMock()
 
-
-class MockVllmConfig:
-    def __init__(self):
-        self.parallel_config = MagicMock()
-        self.cache_config = MagicMock()
-        self.kv_transfer_config = MagicMock()
-        self.parallel_config.tensor_parallel_size = 2
-        self.parallel_config.data_parallel_rank_local = 0 
-        self.parallel_config.data_parallel_size_local = 1
-        self.cache_config.block_size = 16
-        self.kv_transfer_config.kv_port = 5000
-        self.kv_transfer_config.kv_role = 'kv_producer'
-        self.kv_transfer_config.get_from_extra_config = MagicMock()
-        self.kv_transfer_config.get_from_extra_config.side_effect = lambda k, d: {
-            "prefill": {"tp_size": 2, "dp_size": 1},
-            "decode": {"tp_size": 2, "dp_size": 1}
-        }.get(k, d)
-
-
 class MockTransferEngine:
     def initialize(self, *args, **kwargs):
         return 0
@@ -1122,7 +1094,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         ]
         
         for p in self.patches:
-            p.start()
+            p.start() # type: ignore
         
         self.vllm_config = MockVllmConfig()
         self.engine_id = "test_engine"
@@ -1130,7 +1102,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
 
     def tearDown(self):
         for p in self.patches:
-            p.stop()
+            p.stop() # type: ignore
 
     def test_register_kv_caches_producer(self):
         worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id)
