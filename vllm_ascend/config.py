@@ -23,16 +23,12 @@ class MooncakeEngineMetadata:
     model_name: str
     """ world size when running under a distributed setting """
     world_size: int
-    """"""
-
+    """ Initialize the current PCP's rank """
     pcp_rank: int
-
+    """ Initialize the current DCP's rank """
     dcp_rank: int
-
+    """ Initialize the current TP's rank """
     tp_rank: int
-
-    # """ worker id when running under a distributed setting """
-    # worker_id: int
     """ the format of kv tensors """
     kv_dtype: torch.dtype
     """ the shape of kv tensors """
@@ -58,7 +54,7 @@ class MooncakeEngineKey:
             self.world_size,
             self.pcp_rank,
             self.dcp_rank,
-            self.tp_rank,    
+            self.tp_rank,
             self.chunk_hash,
         ))
 
@@ -77,7 +73,7 @@ class MooncakeEngineKey:
                     self.world_size,
                     self.pcp_rank,
                     self.dcp_rank,
-                    self.tp_rank,    
+                    self.tp_rank,
                     self.chunk_hash,
                     layer_id,
                 ))
