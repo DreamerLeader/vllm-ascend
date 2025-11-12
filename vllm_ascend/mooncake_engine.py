@@ -7,13 +7,11 @@ from typing import Generator, List, Optional, Union
 # Third Party
 import torch
 from vllm.config import VllmConfig
-from vllm.utils import logger
-from vllm.distributed import (get_dcp_group,
-                              get_decode_context_model_parallel_rank,
+from vllm.distributed import (get_decode_context_model_parallel_rank,
                               get_decode_context_model_parallel_world_size,
                               get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size,
-                              get_tp_group)
+                              get_tensor_model_parallel_world_size)
+from vllm.utils import logger
 
 from vllm_ascend.distributed.mooncake.config_data import (
     ChunkedTokenDatabase, LasyerMultiBlockReqMeta, MooncakeConnectorMetadata,
@@ -22,7 +20,7 @@ from vllm_ascend.distributed.mooncake.kv_transfer import (
     KVCacheStoreLayerRecvingThread, KVCacheStoreLayerSendingThread,
     KVCacheStoreRecvingThread, KVCacheStoreSendingThread, KVTransferThread)
 from vllm_ascend.distributed.mooncake.mooncake_store import Mooncakestore
-from vllm_ascend.utils import (vllm_version_is, prefill_context_parallel_enable)
+from vllm_ascend.utils import prefill_context_parallel_enable, vllm_version_is
 
 if vllm_version_is("0.11.0"):
     from vllm.utils import get_kv_cache_torch_dtype
@@ -30,8 +28,7 @@ else:
     from vllm.utils.torch_utils import get_kv_cache_torch_dtype
 
 if prefill_context_parallel_enable():
-    from vllm.distributed import (get_pcp_group,
-                                  get_prefill_context_model_parallel_rank,
+    from vllm.distributed import (get_prefill_context_model_parallel_rank,
                                   get_prefill_context_model_parallel_world_size
                                   )
 
@@ -52,9 +49,6 @@ class MooncakeEngine:
                 and model_config.use_mla):
             self.use_mla = True
         self.use_layerwise = use_layerwize
-        # self.tp_rank = parallel_config.rank
-        # self.tp_size = parallel_config.tensor_parallel_size
-
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
 
@@ -75,7 +69,6 @@ class MooncakeEngine:
 
         if self.pcp_size > 1:
             self.block_size *= self.pcp_size
-        
         if self.dcp_size > 1:
             self.block_size *= self.dcp_size
 
@@ -144,7 +137,6 @@ class MooncakeEngine:
                     self.use_mla, first_kv_cache.shape)
 
         self.kv_caches = kv_caches
-        self.m_store.set_kv_caches(kv_caches.values())
         self.kv_caches_base_addr = []
         for cache_or_caches in kv_caches.values():
             # Normalize to always be a list of caches
@@ -259,7 +251,6 @@ class MooncakeEngine:
                             addr_list.append(addr)
                             size_list.append(size)
                             blockIds.append(block_id)
-                        logger.info(f"key_list:{key_list}, addr_list:{addr_list}, size_list:{size_list}, blockIds:{blockIds}")
                         self.m_store.get_batch(key_list, addr_list, size_list,
                                                blockIds)
                     else:
