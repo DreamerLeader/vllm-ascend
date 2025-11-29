@@ -10,6 +10,19 @@ from vllm.v1.core.sched.output import NewRequestData
 
 
 #Parameters related to the key
+@dataclass
+class KeyMetadata:
+    """name of the LLM model"""
+
+    model_name: str
+    """ worker id when running under a distributed setting """
+    head_or_tp_rank: int
+    """ Initialize the current prefill context model parallel rank """
+    pcp_rank: int
+    """ Initialize the current decode context model parallel rank """
+    dcp_rank: int
+
+
 @dataclass(order=True)
 class PoolKey:
     key_metadata: KeyMetadata
