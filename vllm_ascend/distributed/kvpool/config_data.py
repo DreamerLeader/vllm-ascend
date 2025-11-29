@@ -10,15 +10,6 @@ from vllm.v1.core.sched.output import NewRequestData
 
 
 #Parameters related to the key
-@dataclass
-class KeyMetadata:
-    """name of the LLM model"""
-
-    model_name: str
-    """ worker id when running under a distributed setting """
-    head_or_tp_rank: int
-
-
 @dataclass(order=True)
 class PoolKey:
     key_metadata: KeyMetadata
@@ -28,12 +19,15 @@ class PoolKey:
         return hash((
             self.key_metadata.model_name,
             self.key_metadata.head_or_tp_rank,
+            self.key_metadata.pcp_rank,
+            self.key_metadata.dcp_rank,
             self.chunk_hash,
         ))
 
     def to_string(self):
         return (
             f"{self.key_metadata.model_name}"
+            f"@pcp{self.key_metadata.pcp_rank}@dcp{self.key_metadata.dcp_rank}"
             f"@head_or_tp_rank:{self.key_metadata.head_or_tp_rank}@{self.chunk_hash}"
         )
 
@@ -60,6 +54,8 @@ class LayerPoolKey(PoolKey):
         return hash((
             self.key_metadata.model_name,
             self.key_metadata.head_or_tp_rank,
+            self.key_metadata.pcp_rank,
+            self.key_metadata.dcp_rank,
             self.chunk_hash,
             self.layer_id,
         ))
@@ -67,9 +63,9 @@ class LayerPoolKey(PoolKey):
     def to_string(self):
         return (
             f"{self.key_metadata.model_name}"
+            f"@pcp{self.key_metadata.pcp_rank}@dcp{self.key_metadata.dcp_rank}"
             f"@head_or_tp_rank:{self.key_metadata.head_or_tp_rank}@{self.chunk_hash}@{self.layer_id}"
         )
-
 
 class ChunkedTokenDatabase():
 
