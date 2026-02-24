@@ -97,6 +97,37 @@ class KVPoolWorker:
             self.head_or_tp_rank = self.tp_rank
             self.put_step = 1
 
+        # Detect TP asymmetry between prefill and decode for non-MLA models.
+        # When pd_tp_ratio != 1, we use per-head keys so that KV cache
+        # written by one TP configuration can be read by another.
+        self.per_head_keys = False
+        self.local_head_indices: list[int] = [self.head_or_tp_rank]
+        self.num_local_heads = 1  # heads per TP rank
+
+        remote_tp_size = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+            "remote_tp_size", self.tp_size
+        )
+        if not self.use_mla and remote_tp_size != self.tp_size:
+            self.per_head_keys = True
+            # Compute which global head indices this TP rank owns
+            if self.num_kv_head >= self.tp_size:
+                heads_per_rank = self.num_kv_head // self.tp_size
+                start_head = self.tp_rank * heads_per_rank
+                self.local_head_indices = list(range(start_head, start_head + heads_per_rank))
+                self.num_local_heads = heads_per_rank
+            else:
+                # More TP ranks than heads: multiple ranks share one head
+                head_idx = self.tp_rank // (self.tp_size // self.num_kv_head)
+                self.local_head_indices = [head_idx]
+                self.num_local_heads = 1
+
+            logger.info(
+                "Per-head key mode enabled: tp_size=%d, remote_tp_size=%d, "
+                "num_kv_heads=%d, local_head_indices=%s",
+                self.tp_size, remote_tp_size, self.num_kv_head,
+                self.local_head_indices,
+            )
+
         self.metadata = KeyMetadata(
             model_config.model.rstrip("/").split("/")[-1],
             self.head_or_tp_rank,
@@ -130,7 +161,12 @@ class KVPoolWorker:
                     for i in range(2, remaining_layers + 2):
                         partitions[-i] += 1
 
-        self.token_database = ChunkedTokenDatabase(self.metadata, self.block_size, partitions)
+        self.token_database = ChunkedTokenDatabase(
+            self.metadata, self.block_size, partitions,
+            per_head_keys=self.per_head_keys,
+            local_head_indices=self.local_head_indices,
+            num_local_heads=self.num_local_heads,
+        )
 
         backend = backend_map.get(self.backend.lower())
         assert backend is not None
@@ -201,6 +237,23 @@ class KVPoolWorker:
         self.m_store.register_buffer(ptrs, lengths)
         self.token_database.set_kv_caches_base_addr(self.kv_caches_base_addr)
         self.token_database.set_block_len(self.block_len)
+
+        # Compute per-head block length for per-head key mode
+        if self.per_head_keys and not self.use_mla and not self.use_sparse:
+            # For non-MLA: shape is [num_blocks, block_size, num_local_heads, head_dim]
+            # single_head_block_len = block_size * 1 * head_dim * element_size
+            # = full_block_len / num_local_heads
+            single_head_block_len = []
+            for bl in self.block_len:
+                if self.num_local_heads > 0:
+                    single_head_block_len.append(bl // self.num_local_heads)
+                else:
+                    single_head_block_len.append(bl)
+            self.token_database.set_single_head_block_len(single_head_block_len)
+            logger.info(
+                "Per-head block lengths: full=%s, per_head=%s, num_local_heads=%d",
+                self.block_len, single_head_block_len, self.num_local_heads,
+            )
 
         if self.use_layerwise:
             self.get_event = threading.Event()
@@ -278,25 +331,52 @@ class KVPoolWorker:
                         request,
                     )
                 else:
-                    addr_list = []
-                    size_list = []
-                    key_list = []
-                    mask_num = request.load_spec.vllm_cached_tokens // self.block_size * self.block_size
-                    for start, end, key in self.token_database.process_tokens(
-                        token_len, request.block_hashes, mask_num
-                    ):
-                        addr, size, _ = self.token_database.prepare_value(start, end, request.block_ids)
-                        key_list.append(key.to_string())
-                        addr_list.append(addr)
-                        size_list.append(size)
-                    key_list_c = key_list[self.tp_rank % len(key_list) :] + key_list[: self.tp_rank % len(key_list)]
-                    addr_list_c = (
-                        addr_list[self.tp_rank % len(addr_list) :] + addr_list[: self.tp_rank % len(addr_list)]
-                    )
-                    size_list_c = (
-                        size_list[self.tp_rank % len(size_list) :] + size_list[: self.tp_rank % len(size_list)]
-                    )
-                    self.m_store.get(key_list_c, addr_list_c, size_list_c)
+                    if self.per_head_keys:
+                        self._load_kv_per_head(request, token_len)
+                    else:
+                        addr_list = []
+                        size_list = []
+                        key_list = []
+                        mask_num = request.load_spec.vllm_cached_tokens // self.block_size * self.block_size
+                        for start, end, key in self.token_database.process_tokens(
+                            token_len, request.block_hashes, mask_num
+                        ):
+                            addr, size, _ = self.token_database.prepare_value(start, end, request.block_ids)
+                            key_list.append(key.to_string())
+                            addr_list.append(addr)
+                            size_list.append(size)
+                        key_list_c = key_list[self.tp_rank % len(key_list) :] + key_list[: self.tp_rank % len(key_list)]
+                        addr_list_c = (
+                            addr_list[self.tp_rank % len(addr_list) :] + addr_list[: self.tp_rank % len(addr_list)]
+                        )
+                        size_list_c = (
+                            size_list[self.tp_rank % len(size_list) :] + size_list[: self.tp_rank % len(size_list)]
+                        )
+                        self.m_store.get(key_list_c, addr_list_c, size_list_c)
+
+    def _load_kv_per_head(self, request: ReqMeta, token_len: int):
+        """Load KV cache in per-head key mode.
+
+        Each local head reads its own key from the store. This allows
+        decode nodes (with different TP) to correctly load KV cache
+        that was stored by prefill nodes (with different TP).
+        """
+        mask_num = request.load_spec.vllm_cached_tokens // self.block_size * self.block_size  # type: ignore[union-attr]
+        all_key_list = []
+        all_addr_list = []
+        all_size_list = []
+        for start, end, head_keys, local_indices in self.token_database.process_tokens_per_head(
+            token_len, request.block_hashes, mask_num
+        ):
+            for head_key, local_head_idx in zip(head_keys, local_indices):
+                addr, size, _ = self.token_database.prepare_value_per_head(
+                    start, end, request.block_ids, local_head_idx
+                )
+                all_key_list.append(head_key.to_string())
+                all_addr_list.append(addr)
+                all_size_list.append(size)
+        if all_key_list:
+            self.m_store.get(all_key_list, all_addr_list, all_size_list)
 
     def wait_for_layer_load(self) -> None:
         for layerwise_retriever in self.layerwise_retrievers:
@@ -549,6 +629,9 @@ class KVPoolWorker:
         :param tokens: the input tokens, with shape [seq_len]
         :return: An int indicating how many prefix tokens are cached.
         """
+        if self.per_head_keys:
+            return self._lookup_per_head(token_len, block_hashes, use_layerwise)
+
         end = 0
         keys = []
         try:
@@ -575,6 +658,55 @@ class KVPoolWorker:
             return start
         return end
 
+    def _lookup_per_head(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        use_layerwise: bool,
+    ) -> int:
+        """Lookup in per-head mode for the worker side.
+
+        Checks that all local heads have their KV cache stored.
+        """
+        end = 0
+        try:
+            starts = []
+            all_keys = []
+            num_blocks_per_head = 0
+            for start, end, head_keys, _ in self.token_database.process_tokens_per_head(
+                token_len, block_hashes
+            ):
+                starts.append(start)
+                for hk in head_keys:
+                    if use_layerwise:
+                        for lk in hk.split_layers(self.num_layers):
+                            all_keys.append(lk.to_string())
+                    else:
+                        all_keys.append(hk.to_string())
+                if num_blocks_per_head == 0:
+                    num_blocks_per_head = len(head_keys)
+
+            if not all_keys:
+                return 0
+
+            res = self.m_store.exists(all_keys)  # type: ignore[assignment]
+
+            if use_layerwise:
+                res = self.check_all_layers_exists(res, self.num_layers)
+
+            # Each block has num_blocks_per_head entries; all must be present
+            keys_per_block = num_blocks_per_head
+            for block_idx in range(len(starts)):
+                block_start = block_idx * keys_per_block
+                block_end = block_start + keys_per_block
+                if not all(v == 1 for v in res[block_start:block_end]):  # type: ignore[union-attr]
+                    return starts[block_idx]
+
+        except Exception as e:
+            logger.error(f"Remote connection failed in per-head lookup: {e}")
+            return start if starts else 0
+        return end
+
     def lookup_scheduler(
         self,
         token_len: int,
@@ -586,6 +718,9 @@ class KVPoolWorker:
         :param tokens: the input tokens, with shape [seq_len]
         :return: An int indicating how many prefix tokens are cached.
         """
+        if self.per_head_keys:
+            return self._lookup_scheduler_per_head(token_len, block_hashes, use_layerwise)
+
         end = 0
         keys = []
         try:
@@ -630,6 +765,88 @@ class KVPoolWorker:
         except Exception as e:
             logger.error(f"Remote connection failed in contains: {e}")
             return start
+        return end
+
+    def _lookup_scheduler_per_head(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        use_layerwise: bool,
+    ) -> int:
+        """Lookup in per-head key mode.
+
+        In per-head mode, we need to check that ALL heads have their
+        KV cache stored for each block. The key format uses global
+        head indices, so we check all num_kv_head heads.
+        """
+        end = 0
+        try:
+            starts = []
+            # Build keys for head 0 first to get the block structure
+            base_keys = []
+            for start, end, key in self.token_database.process_tokens(token_len, block_hashes):
+                if use_layerwise:
+                    keys_multi_layer = key.split_layers(self.num_layers)
+                    for item in keys_multi_layer:
+                        base_keys.append(item.to_string())
+                else:
+                    base_keys.append(key.to_string())
+                starts.append(start)
+
+            if not base_keys:
+                return 0
+
+            # For per-head mode, check all global head indices
+            all_head_keys = []
+            for head_idx in range(self.num_kv_head):
+                for bk in base_keys:
+                    new_str = bk.replace(
+                        f"@head_or_tp_rank:{self.head_or_tp_rank}",
+                        f"@head_or_tp_rank:{head_idx}", 1
+                    )
+                    all_head_keys.append(new_str)
+
+            # Also check across PP ranks
+            pp_keys = []
+            for i in range(1, self.pp_size):
+                for item in all_head_keys:
+                    new_str = item.replace(
+                        "@pp_rank:0", f"@pp_rank:{i}", 1
+                    )
+                    pp_keys.append(new_str)
+
+            all_keys = all_head_keys + pp_keys
+            res = self.m_store.exists(all_keys)  # type: ignore[assignment]
+
+            num_block = len(base_keys)
+            if use_layerwise:
+                res = self.check_all_layers_exists(res, self.num_layers)
+                num_block = len(base_keys) // self.num_layers
+
+            # For each block, ALL heads must have the data
+            # Group results: [num_kv_head * pp_size][num_block]
+            num_groups = self.num_kv_head * self.pp_size
+            multi_head_values = [
+                res[i * num_block : (i + 1) * num_block]  # type: ignore[index]
+                for i in range(num_groups)
+            ]
+
+            # A block is "cached" only if all heads have it
+            combined = []
+            for block_idx in range(num_block):
+                all_present = all(
+                    multi_head_values[g][block_idx] == 1
+                    for g in range(num_groups)
+                )
+                combined.append(1 if all_present else 0)
+
+            for idx, val in enumerate(combined):
+                if val != 1:
+                    return starts[idx]
+
+        except Exception as e:
+            logger.error(f"Remote connection failed in per-head lookup: {e}")
+            return start if starts else 0
         return end
 
     def check_all_layers_exists(self, res: list[int], num_layers: int) -> list[int]:

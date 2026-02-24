@@ -14,7 +14,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend im
 # isort: off
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     ChunkedTokenDatabase,
+    KeyMetadata,
     LasyerMultiBlockReqMeta,
+    LayerPoolKey,
     ReqMeta,
 )
 # isort: on
@@ -136,6 +138,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.kv_role = kv_role
         self.stored_requests = defaultdict[str, int](int)
         self.enable_kv_event = enable_kv_event
+        self.per_head_keys = token_database.per_head_keys
 
     def add_stored_request(self, req_id: str):
         with self.done_task_lock:
@@ -152,6 +155,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 del self.stored_requests[req_id]
 
     def _handle_request(self, req_meta: ReqMeta):
+        if self.per_head_keys:
+            return self._handle_request_per_head(req_meta)
+
         token_len = req_meta.token_len_chunk
         block_ids = req_meta.block_ids
         req_id = req_meta.req_id
@@ -242,6 +248,65 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.dec_stored_request(req_id)
         self.request_queue.task_done()
 
+    def _handle_request_per_head(self, req_meta: ReqMeta):
+        """Store KV cache in per-head key mode.
+
+        Each local head's data is stored with a separate key using
+        the global head index. This enables cross-TP KV cache sharing.
+        """
+        token_len = req_meta.token_len_chunk
+        block_ids = req_meta.block_ids
+        req_id = req_meta.req_id
+        current_event = req_meta.current_event
+
+        if req_id not in self.stored_requests:
+            self.request_queue.task_done()
+            return
+
+        all_keys = []
+        all_addrs = []
+        all_sizes = []
+
+        for start, end, head_keys, local_indices in self.token_database.process_tokens_per_head(
+            token_len, req_meta.block_hashes
+        ):
+            for head_key, local_head_idx in zip(head_keys, local_indices):
+                key_str = head_key.to_string()
+                addr, size, _ = self.token_database.prepare_value_per_head(
+                    start, end, block_ids, local_head_idx
+                )
+                all_keys.append(key_str)
+                all_addrs.append(addr)
+                all_sizes.append(size)
+
+        if not all_keys:
+            self.dec_stored_request(req_id)
+            return
+
+        # Check which keys already exist to skip them
+        skip_count = self.lookup(all_keys)
+        if skip_count == len(all_keys):
+            self.dec_stored_request(req_id)
+            return
+
+        remaining_keys = all_keys[skip_count:]
+        remaining_addrs = all_addrs[skip_count:]
+        remaining_sizes = all_sizes[skip_count:]
+
+        logger.info(
+            "Per-head storing KV cache for %d out of %d entries "
+            "(skip=%d) for request %s",
+            len(remaining_keys), len(all_keys), skip_count, req_id,
+        )
+
+        if remaining_keys:
+            if current_event is not None:
+                current_event.synchronize()
+            self.m_store.put(remaining_keys, remaining_addrs, remaining_sizes)
+
+        self.dec_stored_request(req_id)
+        self.request_queue.task_done()
+
 
 class KVCacheStoreRecvingThread(KVTransferThread):
     def __init__(
@@ -256,8 +321,12 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         super().__init__(
             m_store, token_database, block_size, tp_rank, dcp_size, ready_event, name="KVCacheStoreRecvingThread"
         )
+        self.per_head_keys = token_database.per_head_keys
 
     def _handle_request(self, req_meta: ReqMeta):
+        if self.per_head_keys:
+            return self._handle_request_per_head(req_meta)
+
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
         req_id = req_meta.req_id
         mask_num = (
@@ -277,6 +346,34 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         addr_list_c = addr_list[self.tp_rank % len(addr_list) :] + addr_list[: self.tp_rank % len(addr_list)]
         size_list_c = size_list[self.tp_rank % len(size_list) :] + size_list[: self.tp_rank % len(size_list)]
         self.m_store.get(key_list_c, addr_list_c, size_list_c)
+        self.set_finished_request(req_id)
+        self.request_queue.task_done()
+
+    def _handle_request_per_head(self, req_meta: ReqMeta):
+        """Receive KV cache in per-head key mode."""
+        token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
+        req_id = req_meta.req_id
+        mask_num = (
+            req_meta.load_spec.vllm_cached_tokens  # type: ignore[union-attr]
+            // self.block_size
+            * self.block_size
+        )
+        all_keys = []
+        all_addrs = []
+        all_sizes = []
+        for start, end, head_keys, local_indices in self.token_database.process_tokens_per_head(
+            token_len, req_meta.block_hashes, mask_num
+        ):
+            for head_key, local_head_idx in zip(head_keys, local_indices):
+                addr, size, _ = self.token_database.prepare_value_per_head(
+                    start, end, req_meta.block_ids, local_head_idx
+                )
+                all_keys.append(head_key.to_string())
+                all_addrs.append(addr)
+                all_sizes.append(size)
+
+        if all_keys:
+            self.m_store.get(all_keys, all_addrs, all_sizes)
         self.set_finished_request(req_id)
         self.request_queue.task_done()
 
@@ -300,6 +397,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.final_layer_id = num_layers - 1
         self.put_step = put_step
         self.enable_kv_event = enable_kv_event
+        self.per_head_keys = token_database.per_head_keys
 
     def add_request(  # type: ignore[override]
         self, req_meta: ReqMeta
@@ -309,6 +407,9 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
     def _handle_request(  # type: ignore[override]
         self, req_meta: LasyerMultiBlockReqMeta
     ):
+        if self.per_head_keys:
+            return self._handle_request_per_head(req_meta)
+
         starts = req_meta.starts
         ends = req_meta.ends
         keys = req_meta.keys
@@ -366,6 +467,72 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             req_meta.req_id,
         )
 
+    def _handle_request_per_head(self, req_meta: LasyerMultiBlockReqMeta):
+        """Layer-wise per-head storage.
+
+        For each block chunk at a given layer, store each local head's
+        data with its own key.
+        """
+        starts = req_meta.starts
+        ends = req_meta.ends
+        keys = req_meta.keys  # LayerPoolKey objects
+        layer_id = req_meta.layer_id
+        current_event = req_meta.current_event
+        is_last_chunk = req_meta.is_last_chunk
+
+        all_keys = []
+        all_addrs = []
+        all_sizes = []
+        local_head_indices = self.token_database.local_head_indices
+
+        for index, key in enumerate(keys):
+            for local_head_idx, global_head_idx in enumerate(local_head_indices):
+                # Create a per-head layer key
+                head_metadata = KeyMetadata(
+                    model_name=key.key_metadata.model_name,
+                    head_or_tp_rank=global_head_idx,
+                    pcp_rank=key.key_metadata.pcp_rank,
+                    dcp_rank=key.key_metadata.dcp_rank,
+                    pp_rank=key.key_metadata.pp_rank,
+                )
+                per_head_key = LayerPoolKey(head_metadata, key.chunk_hash, key.layer_id)
+                addr, size = self.token_database.prepare_value_layer_per_head(
+                    starts[index], ends[index], req_meta.block_ids,
+                    layer_id, local_head_idx,
+                )
+                all_keys.append(per_head_key.to_string())
+                all_addrs.append(addr)
+                all_sizes.append(size)
+
+        if not all_keys:
+            if is_last_chunk:
+                self.set_finished_request(req_meta.req_id)
+            return
+
+        skip_count = self.lookup(all_keys)
+        if skip_count == len(all_keys):
+            if is_last_chunk and layer_id == self.final_layer_id:
+                self.set_finished_request(req_meta.req_id)
+            return
+
+        remaining_keys = all_keys[skip_count:]
+        remaining_addrs = all_addrs[skip_count:]
+        remaining_sizes = all_sizes[skip_count:]
+
+        if current_event is not None:
+            current_event.synchronize()
+        self.m_store.put(remaining_keys, remaining_addrs, remaining_sizes)
+
+        if layer_id == self.final_layer_id and is_last_chunk:
+            self.set_finished_request(req_meta.req_id)
+        self.request_queue.task_done()
+
+        logger.info(
+            "Per-head layer storing KV cache for %d entries "
+            "(skip=%d, layer=%d) for request %s",
+            len(remaining_keys), skip_count, layer_id, req_meta.req_id,
+        )
+
 
 class KVCacheStoreLayerRecvingThread(KVTransferThread):
     def __init__(
@@ -382,6 +549,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             m_store, token_database, block_size, tp_rank, dcp_size, ready_event, name="KVCacheStoreLayerRecvingThread"
         )
         self.get_event = get_event
+        self.per_head_keys = token_database.per_head_keys
 
     def add_request(  # type: ignore[override]
         self, req_meta: LasyerMultiBlockReqMeta
@@ -391,6 +559,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
     def _handle_request(  # type: ignore[override]
         self, req_meta: LasyerMultiBlockReqMeta
     ):
+        if self.per_head_keys:
+            return self._handle_request_per_head(req_meta)
+
         addr_list = []
         size_list = []
         key_list = []
@@ -405,6 +576,37 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         addr_list_c = addr_list[self.tp_rank % len(addr_list) :] + addr_list[: self.tp_rank % len(addr_list)]
         size_list_c = size_list[self.tp_rank % len(size_list) :] + size_list[: self.tp_rank % len(size_list)]
         self.m_store.get(key_list_c, addr_list_c, size_list_c)
+
+        self.request_queue.task_done()
+        self.get_event.set()
+
+    def _handle_request_per_head(self, req_meta: LasyerMultiBlockReqMeta):
+        """Layer-wise per-head receiving."""
+        all_keys = []
+        all_addrs = []
+        all_sizes = []
+        local_head_indices = self.token_database.local_head_indices
+
+        for index, key in enumerate(req_meta.keys):
+            for local_head_idx, global_head_idx in enumerate(local_head_indices):
+                head_metadata = KeyMetadata(
+                    model_name=key.key_metadata.model_name,
+                    head_or_tp_rank=global_head_idx,
+                    pcp_rank=key.key_metadata.pcp_rank,
+                    dcp_rank=key.key_metadata.dcp_rank,
+                    pp_rank=key.key_metadata.pp_rank,
+                )
+                per_head_key = LayerPoolKey(head_metadata, key.chunk_hash, key.layer_id)
+                addr, size = self.token_database.prepare_value_layer_per_head(
+                    req_meta.starts[index], req_meta.ends[index],
+                    req_meta.block_ids, req_meta.layer_id, local_head_idx,
+                )
+                all_keys.append(per_head_key.to_string())
+                all_addrs.append(addr)
+                all_sizes.append(size)
+
+        if all_keys:
+            self.m_store.get(all_keys, all_addrs, all_sizes)
 
         self.request_queue.task_done()
         self.get_event.set()

@@ -92,12 +92,25 @@ class LayerPoolKey(PoolKey):
 
 
 class ChunkedTokenDatabase:
-    def __init__(self, metadata: KeyMetadata, block_size: int, partitions: list[int] | None):
+    def __init__(self, metadata: KeyMetadata, block_size: int, partitions: list[int] | None,
+                 per_head_keys: bool = False, local_head_indices: list[int] | None = None,
+                 num_local_heads: int = 1):
         self.metadata = metadata
         self.block_size = block_size
         self.kv_caches_base_addr: list[int] = []
         self.block_len: list[int] = []
         self.partitions = partitions
+        # Per-head key mode: when prefill TP != decode TP for non-MLA models,
+        # each KV head is stored with its own key so that different TP
+        # configurations can correctly read/write the shared KV cache.
+        self.per_head_keys = per_head_keys
+        # The global head indices owned by this TP rank (e.g. rank 0 with TP=4
+        # and 8 heads owns [0, 1])
+        self.local_head_indices = local_head_indices or [0]
+        self.num_local_heads = num_local_heads
+        # Size of a single head's KV data within one block (set during
+        # register_kv_caches)
+        self.single_head_block_len: list[int] = []
 
     def _make_key_by_hash(self, chunk_hash: str, layer_id: int | None = None):
         assert self.metadata is not None
@@ -106,11 +119,35 @@ class ChunkedTokenDatabase:
             chunk_hash,
         )
 
+    def _make_per_head_keys_by_hash(self, chunk_hash: str) -> list[PoolKey]:
+        """Create one PoolKey per local head, each with a distinct
+        head_or_tp_rank set to the global head index."""
+        assert self.metadata is not None
+        keys = []
+        for head_idx in self.local_head_indices:
+            head_metadata = KeyMetadata(
+                model_name=self.metadata.model_name,
+                head_or_tp_rank=head_idx,
+                pcp_rank=self.metadata.pcp_rank,
+                dcp_rank=self.metadata.dcp_rank,
+                pp_rank=self.metadata.pp_rank,
+            )
+            keys.append(PoolKey(head_metadata, chunk_hash))
+        return keys
+
     def set_kv_caches_base_addr(self, kv_caches_base_addr: list[int]):
         self.kv_caches_base_addr = kv_caches_base_addr
 
     def set_block_len(self, block_len: list[int]):
         self.block_len = block_len
+
+    def set_single_head_block_len(self, single_head_block_len: list[int]):
+        """Set the per-head block length for per-head key mode.
+        For non-MLA models, the KV cache layout is
+        [num_blocks, block_size, num_local_heads, head_dim].
+        single_head_block_len = block_size * 1 * head_dim * element_size
+        (one entry per k/v tensor)."""
+        self.single_head_block_len = single_head_block_len
 
     def prepare_value(self, start: int, end: int, block_ids: list[int]):
         addr_list = []
@@ -124,6 +161,41 @@ class ChunkedTokenDatabase:
             size_list.append(size)
         return addr_list, size_list, block_id
 
+    def prepare_value_per_head(self, start: int, end: int, block_ids: list[int],
+                               head_local_idx: int):
+        """Prepare addresses and sizes for a single head within a block.
+
+        For non-MLA models the KV cache tensor shape is
+        [num_blocks, block_size, num_local_heads, head_dim].
+        This computes the address offset for a specific local head index
+        so we can store/load each head independently.
+
+        Args:
+            start: token start index
+            end: token end index
+            block_ids: allocated block ids
+            head_local_idx: local head index within this TP rank (0-based)
+        Returns:
+            (addr_list, size_list, block_id)
+        """
+        addr_list = []
+        size_list = []
+        block_id = block_ids[start // self.block_size]
+        length = len(self.single_head_block_len)
+        for index, base_addr in enumerate(self.kv_caches_base_addr):
+            # Offset to the start of this block
+            block_offset = block_id * self.block_len[index % len(self.block_len)]
+            # Offset within the block to the specific head
+            # Layout: [block_size, num_local_heads, head_dim] -> head stride
+            # = single_head_block_len
+            head_offset = head_local_idx * self.single_head_block_len[index % length]
+            addr = base_addr + block_offset + head_offset
+            num_tokens = end - start
+            size = int(self.single_head_block_len[index % length] / self.block_size * num_tokens)
+            addr_list.append(addr)
+            size_list.append(size)
+        return addr_list, size_list, block_id
+
     def prepare_value_layer(self, start: int, end: int, block_ids: list[int], layer_id: int):
         block_id = block_ids[start // self.block_size]
         addr_list = []
@@ -132,6 +204,24 @@ class ChunkedTokenDatabase:
         for i in range(length):
             addr = self.kv_caches_base_addr[layer_id * length] + block_id * self.block_len[i]
             size = int(self.block_len[i] / self.block_size * (end - start))
+            addr_list.append(addr)
+            size_list.append(size)
+        return addr_list, size_list
+
+    def prepare_value_layer_per_head(self, start: int, end: int, block_ids: list[int],
+                                     layer_id: int, head_local_idx: int):
+        """Layer-wise version of prepare_value_per_head."""
+        block_id = block_ids[start // self.block_size]
+        addr_list = []
+        size_list = []
+        bl_length = len(self.block_len)
+        sh_length = len(self.single_head_block_len)
+        for i in range(bl_length):
+            block_offset = block_id * self.block_len[i]
+            head_offset = head_local_idx * self.single_head_block_len[i % sh_length]
+            addr = self.kv_caches_base_addr[layer_id * bl_length + i] + block_offset + head_offset
+            num_tokens = end - start
+            size = int(self.single_head_block_len[i % sh_length] / self.block_size * num_tokens)
             addr_list.append(addr)
             size_list.append(size)
         return addr_list, size_list
@@ -179,6 +269,41 @@ class ChunkedTokenDatabase:
                 continue
             else:
                 yield start_idx, end_idx, self._make_key_by_hash(hash_val)
+
+    def process_tokens_per_head(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash] | list[str],
+        mask_num: int = 0,
+    ) -> Iterable[tuple[int, int, list[PoolKey], list[int]]]:
+        """Process tokens and return per-head keys for each block.
+
+        Similar to process_tokens but yields a list of PoolKeys (one per
+        local head) and corresponding local head indices for each block chunk.
+
+        Yields:
+            (start, end, head_keys, local_head_indices) where head_keys is a
+            list of PoolKey with each key's head_or_tp_rank set to the global
+            head index.
+        """
+        if not block_hashes:
+            return
+        if not isinstance(block_hashes[0], str):
+            block_hashes = [
+                h.hex()  # type: ignore[union-attr]
+                for h in block_hashes
+            ]
+        for chunk_id, hash_val in enumerate(block_hashes):
+            start_idx = chunk_id * self.block_size
+            if start_idx >= token_len:
+                break
+            end_idx = min(start_idx + self.block_size, token_len)
+            if start_idx < mask_num:
+                continue
+            else:
+                head_keys = self._make_per_head_keys_by_hash(hash_val)
+                local_indices = list(range(len(self.local_head_indices)))
+                yield start_idx, end_idx, head_keys, local_indices
 
     def decode_adaptor_prefill_pp(self, key, addr, size):
         if self.partitions is None or len(self.partitions) == 1:
