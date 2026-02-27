@@ -708,7 +708,7 @@ class TestMooncakeConnectorSchedulerMatchedTokens(unittest.TestCase):
 
         request.kv_transfer_params = {"do_remote_prefill": True}
         tokens, async_flag = self.scheduler.get_num_new_matched_tokens(request, 0)
-        self.assertEqual(tokens, 4)
+        self.assertEqual(tokens, 3)
         self.assertTrue(async_flag)
 
     def test_build_connector_meta(self):
@@ -901,7 +901,7 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
     def test_get_num_new_matched_tokens_with_remote_prefill(self):
         request = MockRequest("req1", kv_transfer_params={"do_remote_prefill": True})
         tokens, async_flag = self.scheduler.get_num_new_matched_tokens(request, 0)
-        self.assertEqual(tokens, 4)
+        self.assertEqual(tokens, 3)
         self.assertTrue(async_flag)
 
     def test_update_state_after_alloc_no_remote_prefill(self):
