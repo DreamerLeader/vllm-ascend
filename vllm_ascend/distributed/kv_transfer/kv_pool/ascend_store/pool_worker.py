@@ -240,9 +240,11 @@ class KVPoolWorker:
 
         # Compute per-head block length for per-head key mode
         if self.per_head_keys and not self.use_mla and not self.use_sparse:
-            # For non-MLA: shape is [num_blocks, block_size, num_local_heads, head_dim]
-            # single_head_block_len = block_size * 1 * head_dim * element_size
-            # = full_block_len / num_local_heads
+            # KV cache shape: [num_blocks, block_size, num_local_heads, head_dim]
+            # single_head_block_len = block_size * head_dim * element_size
+            #                       = full_block_len / num_local_heads
+            # NOTE: heads are at dim-2, so per-head data is NOT contiguous.
+            # prepare_value_per_head uses scatter-gather (one addr per token).
             single_head_block_len = []
             for bl in self.block_len:
                 if self.num_local_heads > 0:

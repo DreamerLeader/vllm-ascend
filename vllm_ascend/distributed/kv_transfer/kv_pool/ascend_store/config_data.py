@@ -165,35 +165,51 @@ class ChunkedTokenDatabase:
                                head_local_idx: int):
         """Prepare addresses and sizes for a single head within a block.
 
-        For non-MLA models the KV cache tensor shape is
-        [num_blocks, block_size, num_local_heads, head_dim].
-        This computes the address offset for a specific local head index
-        so we can store/load each head independently.
+        KV cache layout is [num_blocks, block_size, num_local_heads, head_dim].
+        In this layout, each head's data across tokens is NOT contiguous —
+        heads are interleaved per token:
+            token0: [head0(head_dim), head1(head_dim), ..., headN(head_dim)]
+            token1: [head0(head_dim), head1(head_dim), ..., headN(head_dim)]
+            ...
+
+        To correctly scatter-gather each head's data, we return one (addr, size)
+        pair per token per KV tensor, pointing to just the head_dim bytes for
+        head_local_idx at that token. The Mooncake backend's
+        batch_put/get_from_multi_buffers supports this natively.
 
         Args:
-            start: token start index
+            start: token start index (typically block-aligned)
             end: token end index
             block_ids: allocated block ids
             head_local_idx: local head index within this TP rank (0-based)
         Returns:
             (addr_list, size_list, block_id)
+            addr_list: [kv0_t0, kv0_t1, ..., kv1_t0, kv1_t1, ...] — one entry
+                       per token per KV tensor
+            size_list: matching sizes, each equal to head_dim * element_size
         """
         addr_list = []
         size_list = []
         block_id = block_ids[start // self.block_size]
+        num_tokens = end - start
+        start_in_block = start % self.block_size
         length = len(self.single_head_block_len)
         for index, base_addr in enumerate(self.kv_caches_base_addr):
-            # Offset to the start of this block
-            block_offset = block_id * self.block_len[index % len(self.block_len)]
-            # Offset within the block to the specific head
-            # Layout: [block_size, num_local_heads, head_dim] -> head stride
-            # = single_head_block_len
-            head_offset = head_local_idx * self.single_head_block_len[index % length]
-            addr = base_addr + block_offset + head_offset
-            num_tokens = end - start
-            size = int(self.single_head_block_len[index % length] / self.block_size * num_tokens)
-            addr_list.append(addr)
-            size_list.append(size)
+            full_block_len = self.block_len[index % len(self.block_len)]
+            single_head_len = self.single_head_block_len[index % length]
+            block_offset = block_id * full_block_len
+            # In [num_blocks, block_size, num_local_heads, head_dim]:
+            #   token_stride = num_local_heads * head_dim * elem = block_len / block_size
+            #   head stride within a token = head_dim * elem = single_head_len / block_size
+            token_stride = full_block_len // self.block_size
+            head_dim_bytes = single_head_len // self.block_size
+            head_offset_in_token = head_local_idx * head_dim_bytes
+            for t in range(num_tokens):
+                addr_t = (base_addr + block_offset
+                          + (start_in_block + t) * token_stride
+                          + head_offset_in_token)
+                addr_list.append(addr_t)
+                size_list.append(head_dim_bytes)
         return addr_list, size_list, block_id
 
     def prepare_value_layer(self, start: int, end: int, block_ids: list[int], layer_id: int):
@@ -210,20 +226,33 @@ class ChunkedTokenDatabase:
 
     def prepare_value_layer_per_head(self, start: int, end: int, block_ids: list[int],
                                      layer_id: int, head_local_idx: int):
-        """Layer-wise version of prepare_value_per_head."""
+        """Layer-wise version of prepare_value_per_head.
+
+        Same scatter-gather logic as prepare_value_per_head but selects the
+        base address via layer_id.  Returns one (addr, size) pair per token
+        per KV tensor so the caller can drive non-contiguous DMA correctly.
+        """
         block_id = block_ids[start // self.block_size]
+        num_tokens = end - start
+        start_in_block = start % self.block_size
         addr_list = []
         size_list = []
         bl_length = len(self.block_len)
         sh_length = len(self.single_head_block_len)
         for i in range(bl_length):
-            block_offset = block_id * self.block_len[i]
-            head_offset = head_local_idx * self.single_head_block_len[i % sh_length]
-            addr = self.kv_caches_base_addr[layer_id * bl_length + i] + block_offset + head_offset
-            num_tokens = end - start
-            size = int(self.single_head_block_len[i % sh_length] / self.block_size * num_tokens)
-            addr_list.append(addr)
-            size_list.append(size)
+            full_block_len = self.block_len[i]
+            single_head_len = self.single_head_block_len[i % sh_length]
+            block_offset = block_id * full_block_len
+            token_stride = full_block_len // self.block_size
+            head_dim_bytes = single_head_len // self.block_size
+            head_offset_in_token = head_local_idx * head_dim_bytes
+            base_addr = self.kv_caches_base_addr[layer_id * bl_length + i]
+            for t in range(num_tokens):
+                addr_t = (base_addr + block_offset
+                          + (start_in_block + t) * token_stride
+                          + head_offset_in_token)
+                addr_list.append(addr_t)
+                size_list.append(head_dim_bytes)
         return addr_list, size_list
 
     def process_tokens(
