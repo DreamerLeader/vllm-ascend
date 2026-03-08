@@ -253,56 +253,72 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
         Each local head's data is stored with a separate key using
         the global head index. This enables cross-TP KV cache sharing.
+
+        Because the KV cache layout is [block_size, num_heads, head_dim]
+        (per-head data non-contiguous), we process one block at a time:
+        1. Permute the block data to the staging buffer (heads-first)
+        2. DMA from the staging buffer (contiguous per-head)
         """
         token_len = req_meta.token_len_chunk
         block_ids = req_meta.block_ids
         req_id = req_meta.req_id
         current_event = req_meta.current_event
+        event_synced = False
 
         if req_id not in self.stored_requests:
             self.request_queue.task_done()
             return
 
-        all_keys = []
-        all_addrs = []
-        all_sizes = []
+        total_entries = 0
+        stored_entries = 0
 
         for start, end, head_keys, local_indices in self.token_database.process_tokens_per_head(
             token_len, req_meta.block_hashes
         ):
-            for head_key, local_head_idx in zip(head_keys, local_indices):
-                key_str = head_key.to_string()
+            # Build keys for this block's heads
+            block_head_keys = [hk.to_string() for hk in head_keys]
+            total_entries += len(block_head_keys)
+
+            # Check which heads already exist for this block
+            skip_count = self.lookup(block_head_keys)
+            if skip_count == len(block_head_keys):
+                continue  # all heads stored for this block
+
+            # Synchronize the compute event once (before first DMA)
+            if not event_synced and current_event is not None:
+                current_event.synchronize()
+                event_synced = True
+
+            # Permute block data to staging buffer
+            block_id = block_ids[start // self.block_size]
+            self.token_database.permute_block_to_staging(block_id)
+
+            # Collect staging addresses for remaining heads
+            keys_batch = []
+            addrs_batch = []
+            sizes_batch = []
+            remaining_keys_local = block_head_keys[skip_count:]
+            remaining_indices = local_indices[skip_count:]
+            for key_str, local_head_idx in zip(
+                remaining_keys_local, remaining_indices
+            ):
                 addr, size, _ = self.token_database.prepare_value_per_head(
                     start, end, block_ids, local_head_idx
                 )
-                all_keys.append(key_str)
-                all_addrs.append(addr)
-                all_sizes.append(size)
+                keys_batch.append(key_str)
+                addrs_batch.append(addr)
+                sizes_batch.append(size)
 
-        if not all_keys:
-            self.dec_stored_request(req_id)
-            return
+            if keys_batch:
+                self.m_store.put(keys_batch, addrs_batch, sizes_batch)
+                stored_entries += len(keys_batch)
 
-        # Check which keys already exist to skip them
-        skip_count = self.lookup(all_keys)
-        if skip_count == len(all_keys):
-            self.dec_stored_request(req_id)
-            return
-
-        remaining_keys = all_keys[skip_count:]
-        remaining_addrs = all_addrs[skip_count:]
-        remaining_sizes = all_sizes[skip_count:]
-
-        logger.info(
-            "Per-head storing KV cache for %d out of %d entries "
-            "(skip=%d) for request %s",
-            len(remaining_keys), len(all_keys), skip_count, req_id,
-        )
-
-        if remaining_keys:
-            if current_event is not None:
-                current_event.synchronize()
-            self.m_store.put(remaining_keys, remaining_addrs, remaining_sizes)
+        if stored_entries > 0:
+            logger.info(
+                "Per-head storing KV cache for %d out of %d entries "
+                "for request %s",
+                stored_entries, total_entries, req_id,
+            )
 
         self.dec_stored_request(req_id)
         self.request_queue.task_done()
@@ -350,7 +366,12 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         self.request_queue.task_done()
 
     def _handle_request_per_head(self, req_meta: ReqMeta):
-        """Receive KV cache in per-head key mode."""
+        """Receive KV cache in per-head key mode.
+
+        Processes one block at a time:
+        1. DMA all heads' data for this block into staging buffer
+        2. Permute from staging buffer back to KV cache
+        """
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
         req_id = req_meta.req_id
         mask_num = (
@@ -358,22 +379,27 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             // self.block_size
             * self.block_size
         )
-        all_keys = []
-        all_addrs = []
-        all_sizes = []
         for start, end, head_keys, local_indices in self.token_database.process_tokens_per_head(
             token_len, req_meta.block_hashes, mask_num
         ):
+            block_keys = []
+            block_addrs = []
+            block_sizes = []
             for head_key, local_head_idx in zip(head_keys, local_indices):
                 addr, size, _ = self.token_database.prepare_value_per_head(
                     start, end, req_meta.block_ids, local_head_idx
                 )
-                all_keys.append(head_key.to_string())
-                all_addrs.append(addr)
-                all_sizes.append(size)
+                block_keys.append(head_key.to_string())
+                block_addrs.append(addr)
+                block_sizes.append(size)
 
-        if all_keys:
-            self.m_store.get(all_keys, all_addrs, all_sizes)
+            if block_keys:
+                # DMA into staging buffer
+                self.m_store.get(block_keys, block_addrs, block_sizes)
+                # Permute from staging back to KV cache
+                block_id = req_meta.block_ids[start // self.block_size]
+                self.token_database.permute_staging_to_block(block_id)
+
         self.set_finished_request(req_id)
         self.request_queue.task_done()
 
@@ -471,7 +497,9 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         """Layer-wise per-head storage.
 
         For each block chunk at a given layer, store each local head's
-        data with its own key.
+        data with its own key.  Processes one block at a time:
+        1. Permute the layer's block data to the staging buffer
+        2. DMA from staging buffer (contiguous per-head)
         """
         starts = req_meta.starts
         ends = req_meta.ends
@@ -479,15 +507,15 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         layer_id = req_meta.layer_id
         current_event = req_meta.current_event
         is_last_chunk = req_meta.is_last_chunk
-
-        all_keys = []
-        all_addrs = []
-        all_sizes = []
         local_head_indices = self.token_database.local_head_indices
+        event_synced = False
+        total_entries = 0
+        stored_entries = 0
 
         for index, key in enumerate(keys):
-            for local_head_idx, global_head_idx in enumerate(local_head_indices):
-                # Create a per-head layer key
+            # Build per-head keys for this block
+            block_head_keys = []
+            for global_head_idx in local_head_indices:
                 head_metadata = KeyMetadata(
                     model_name=key.key_metadata.model_name,
                     head_or_tp_rank=global_head_idx,
@@ -495,43 +523,61 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                     dcp_rank=key.key_metadata.dcp_rank,
                     pp_rank=key.key_metadata.pp_rank,
                 )
-                per_head_key = LayerPoolKey(head_metadata, key.chunk_hash, key.layer_id)
+                per_head_key = LayerPoolKey(
+                    head_metadata, key.chunk_hash, key.layer_id
+                )
+                block_head_keys.append(per_head_key.to_string())
+
+            total_entries += len(block_head_keys)
+
+            # Check which heads already exist
+            skip_count = self.lookup(block_head_keys)
+            if skip_count == len(block_head_keys):
+                continue
+
+            # Synchronize compute event once
+            if not event_synced and current_event is not None:
+                current_event.synchronize()
+                event_synced = True
+
+            # Permute this layer's block to staging buffer
+            block_id = req_meta.block_ids[starts[index] // self.block_size]
+            self.token_database.permute_layer_block_to_staging(
+                block_id, layer_id
+            )
+
+            # Collect staging addresses for remaining heads
+            keys_batch = []
+            addrs_batch = []
+            sizes_batch = []
+            for local_head_idx in range(skip_count, len(local_head_indices)):
                 addr, size = self.token_database.prepare_value_layer_per_head(
                     starts[index], ends[index], req_meta.block_ids,
                     layer_id, local_head_idx,
                 )
-                all_keys.append(per_head_key.to_string())
-                all_addrs.append(addr)
-                all_sizes.append(size)
+                keys_batch.append(block_head_keys[local_head_idx])
+                addrs_batch.append(addr)
+                sizes_batch.append(size)
 
-        if not all_keys:
+            if keys_batch:
+                self.m_store.put(keys_batch, addrs_batch, sizes_batch)
+                stored_entries += len(keys_batch)
+
+        if not total_entries:
             if is_last_chunk:
                 self.set_finished_request(req_meta.req_id)
             return
-
-        skip_count = self.lookup(all_keys)
-        if skip_count == len(all_keys):
-            if is_last_chunk and layer_id == self.final_layer_id:
-                self.set_finished_request(req_meta.req_id)
-            return
-
-        remaining_keys = all_keys[skip_count:]
-        remaining_addrs = all_addrs[skip_count:]
-        remaining_sizes = all_sizes[skip_count:]
-
-        if current_event is not None:
-            current_event.synchronize()
-        self.m_store.put(remaining_keys, remaining_addrs, remaining_sizes)
 
         if layer_id == self.final_layer_id and is_last_chunk:
             self.set_finished_request(req_meta.req_id)
         self.request_queue.task_done()
 
-        logger.info(
-            "Per-head layer storing KV cache for %d entries "
-            "(skip=%d, layer=%d) for request %s",
-            len(remaining_keys), skip_count, layer_id, req_meta.req_id,
-        )
+        if stored_entries > 0:
+            logger.info(
+                "Per-head layer storing KV cache for %d entries "
+                "(layer=%d) for request %s",
+                stored_entries, layer_id, req_meta.req_id,
+            )
 
 
 class KVCacheStoreLayerRecvingThread(KVTransferThread):
@@ -581,13 +627,19 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.get_event.set()
 
     def _handle_request_per_head(self, req_meta: LasyerMultiBlockReqMeta):
-        """Layer-wise per-head receiving."""
-        all_keys = []
-        all_addrs = []
-        all_sizes = []
+        """Layer-wise per-head receiving.
+
+        Processes one block at a time:
+        1. DMA all heads' data for this block into staging buffer
+        2. Permute from staging buffer back to KV cache
+        """
         local_head_indices = self.token_database.local_head_indices
+        layer_id = req_meta.layer_id
 
         for index, key in enumerate(req_meta.keys):
+            block_keys = []
+            block_addrs = []
+            block_sizes = []
             for local_head_idx, global_head_idx in enumerate(local_head_indices):
                 head_metadata = KeyMetadata(
                     model_name=key.key_metadata.model_name,
@@ -596,17 +648,27 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     dcp_rank=key.key_metadata.dcp_rank,
                     pp_rank=key.key_metadata.pp_rank,
                 )
-                per_head_key = LayerPoolKey(head_metadata, key.chunk_hash, key.layer_id)
+                per_head_key = LayerPoolKey(
+                    head_metadata, key.chunk_hash, key.layer_id
+                )
                 addr, size = self.token_database.prepare_value_layer_per_head(
                     req_meta.starts[index], req_meta.ends[index],
-                    req_meta.block_ids, req_meta.layer_id, local_head_idx,
+                    req_meta.block_ids, layer_id, local_head_idx,
                 )
-                all_keys.append(per_head_key.to_string())
-                all_addrs.append(addr)
-                all_sizes.append(size)
+                block_keys.append(per_head_key.to_string())
+                block_addrs.append(addr)
+                block_sizes.append(size)
 
-        if all_keys:
-            self.m_store.get(all_keys, all_addrs, all_sizes)
+            if block_keys:
+                # DMA into staging buffer
+                self.m_store.get(block_keys, block_addrs, block_sizes)
+                # Permute from staging back to KV cache
+                block_id = req_meta.block_ids[
+                    req_meta.starts[index] // self.block_size
+                ]
+                self.token_database.permute_layer_staging_to_block(
+                    block_id, layer_id
+                )
 
         self.request_queue.task_done()
         self.get_event.set()

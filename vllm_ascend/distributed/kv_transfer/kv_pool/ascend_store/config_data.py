@@ -111,6 +111,25 @@ class ChunkedTokenDatabase:
         # Size of a single head's KV data within one block (set during
         # register_kv_caches)
         self.single_head_block_len: list[int] = []
+        # Staging buffer for per-head permute operations.
+        # KV cache layout is [num_blocks, block_size, num_heads, head_dim]
+        # (heads NOT in the first block dimension), so per-head data is
+        # non-contiguous within a block.  The staging buffer holds one
+        # block's data in [num_heads, block_size, head_dim] layout (heads
+        # first) so that per-head data IS contiguous for DMA transfer.
+        #
+        # Staging buffer shape:
+        #   non-layerwise: [total_kv_tensors, num_local_heads, block_size, head_dim]
+        #   layerwise:     [num_kv_per_layer, num_local_heads, block_size, head_dim]
+        self.staging_buffer: torch.Tensor | None = None
+        self.staging_base_addr: int = 0
+        # References to the KV cache tensor objects for permute operations.
+        # Order matches kv_caches_base_addr: [layer0_kv0, layer0_kv1, layer1_kv0, ...]
+        self.kv_cache_tensors: list[torch.Tensor] = []
+        # Dimensions needed for staging buffer address calculation
+        self.head_dim: int = 0
+        self.elem_size: int = 0
+        self.num_kv_per_layer: int = 1
 
     def _make_key_by_hash(self, chunk_hash: str, layer_id: int | None = None):
         assert self.metadata is not None
@@ -143,11 +162,87 @@ class ChunkedTokenDatabase:
 
     def set_single_head_block_len(self, single_head_block_len: list[int]):
         """Set the per-head block length for per-head key mode.
-        For non-MLA models, the KV cache layout is
-        [num_blocks, block_size, num_local_heads, head_dim].
-        single_head_block_len = block_size * 1 * head_dim * element_size
+        The physical KV cache layout within each block is
+        [block_size, num_local_heads, head_dim] — heads are NOT in the
+        first dimension, so per-head data is non-contiguous in the
+        original layout.  We use a staging buffer to permute to
+        [num_local_heads, block_size, head_dim] before DMA transfer.
+        single_head_block_len = block_size * head_dim * element_size
         (one entry per k/v tensor)."""
         self.single_head_block_len = single_head_block_len
+
+    def set_staging_info(
+        self,
+        staging_buffer: torch.Tensor,
+        kv_cache_tensors: list[torch.Tensor],
+        head_dim: int,
+        elem_size: int,
+        num_kv_per_layer: int,
+    ):
+        """Configure the staging buffer and KV cache tensor references.
+
+        Args:
+            staging_buffer: Pre-allocated tensor for per-head permute,
+                shape [N, num_local_heads, block_size, head_dim] where
+                N = total_kv_tensors (non-layerwise) or num_kv_per_layer.
+            kv_cache_tensors: References to all KV cache tensors in the
+                same order as kv_caches_base_addr.
+            head_dim: Size of the head dimension.
+            elem_size: Element size in bytes.
+            num_kv_per_layer: Number of KV tensors per layer (e.g. 2
+                for standard attention with separate K and V).
+        """
+        self.staging_buffer = staging_buffer
+        self.staging_base_addr = staging_buffer.data_ptr()
+        self.kv_cache_tensors = kv_cache_tensors
+        self.head_dim = head_dim
+        self.elem_size = elem_size
+        self.num_kv_per_layer = num_kv_per_layer
+
+    # ---- permute helpers (non-layerwise) --------------------------------
+
+    def permute_block_to_staging(self, block_id: int):
+        """Copy one block from ALL KV cache tensors to staging buffer.
+
+        Source layout (per block): [block_size, num_local_heads, head_dim]
+        Staging layout (per slot): [num_local_heads, block_size, head_dim]
+
+        After this call the staging buffer contains heads-first data so
+        that each head's tokens are contiguous — ready for DMA.
+        """
+        for i, kv_tensor in enumerate(self.kv_cache_tensors):
+            # kv_tensor: [num_blocks, block_size, num_local_heads, head_dim]
+            self.staging_buffer[i] = kv_tensor[block_id].permute(1, 0, 2)
+
+    def permute_staging_to_block(self, block_id: int):
+        """Copy one block from staging buffer back to ALL KV cache tensors.
+
+        Always copies the full physical block.  For partial blocks the
+        unused token slots may contain stale data, but they are masked
+        during attention so this is safe.
+        """
+        for i, kv_tensor in enumerate(self.kv_cache_tensors):
+            kv_tensor[block_id] = self.staging_buffer[i].permute(1, 0, 2)
+
+    # ---- permute helpers (layerwise) ------------------------------------
+
+    def permute_layer_block_to_staging(self, block_id: int, layer_id: int):
+        """Copy one block for a single layer's KV tensors to staging."""
+        nkv = self.num_kv_per_layer
+        for i in range(nkv):
+            kv_idx = layer_id * nkv + i
+            self.staging_buffer[i] = (
+                self.kv_cache_tensors[kv_idx][block_id].permute(1, 0, 2)
+            )
+
+    def permute_layer_staging_to_block(self, block_id: int, layer_id: int):
+        """Copy one block for a single layer from staging back to KV cache."""
+        nkv = self.num_kv_per_layer
+        for i in range(nkv):
+            kv_idx = layer_id * nkv + i
+            self.kv_cache_tensors[kv_idx][block_id] = (
+                self.staging_buffer[i].permute(1, 0, 2)
+            )
 
     def prepare_value(self, start: int, end: int, block_ids: list[int]):
         addr_list = []
@@ -163,19 +258,21 @@ class ChunkedTokenDatabase:
 
     def prepare_value_per_head(self, start: int, end: int, block_ids: list[int],
                                head_local_idx: int):
-        """Prepare addresses and sizes for a single head within a block.
+        """Prepare staging-buffer addresses for a single head within a block.
 
-        KV cache layout is [num_blocks, block_size, num_local_heads, head_dim].
-        In this layout, each head's data across tokens is NOT contiguous —
-        heads are interleaved per token:
-            token0: [head0(head_dim), head1(head_dim), ..., headN(head_dim)]
-            token1: [head0(head_dim), head1(head_dim), ..., headN(head_dim)]
-            ...
+        The physical KV cache layout within each block is
+        [block_size, num_local_heads, head_dim] — per-head data is NOT
+        contiguous.  Callers must first call ``permute_block_to_staging``
+        (store) or ``permute_staging_to_block`` (load) to move data
+        between the KV cache and the staging buffer.
 
-        To correctly scatter-gather each head's data, we return one (addr, size)
-        pair per token per KV tensor, pointing to just the head_dim bytes for
-        head_local_idx at that token. The Mooncake backend's
-        batch_put/get_from_multi_buffers supports this natively.
+        The staging buffer layout is
+        [total_kv_tensors, num_local_heads, block_size, head_dim],
+        where each head's tokens across the block ARE contiguous.
+
+        Returns one (addr, size) pair per KV tensor, pointing into the
+        staging buffer region for *head_local_idx* covering tokens
+        [start, end).
 
         Args:
             start: token start index (typically block-aligned)
@@ -184,32 +281,25 @@ class ChunkedTokenDatabase:
             head_local_idx: local head index within this TP rank (0-based)
         Returns:
             (addr_list, size_list, block_id)
-            addr_list: [kv0_t0, kv0_t1, ..., kv1_t0, kv1_t1, ...] — one entry
-                       per token per KV tensor
-            size_list: matching sizes, each equal to head_dim * element_size
         """
         addr_list = []
         size_list = []
         block_id = block_ids[start // self.block_size]
         num_tokens = end - start
-        start_in_block = start % self.block_size
-        length = len(self.single_head_block_len)
-        for index, base_addr in enumerate(self.kv_caches_base_addr):
-            full_block_len = self.block_len[index % len(self.block_len)]
-            single_head_len = self.single_head_block_len[index % length]
-            block_offset = block_id * full_block_len
-            # In [num_blocks, block_size, num_local_heads, head_dim]:
-            #   token_stride = num_local_heads * head_dim * elem = block_len / block_size
-            #   head stride within a token = head_dim * elem = single_head_len / block_size
-            token_stride = full_block_len // self.block_size
-            head_dim_bytes = single_head_len // self.block_size
-            head_offset_in_token = head_local_idx * head_dim_bytes
-            for t in range(num_tokens):
-                addr_t = (base_addr + block_offset
-                          + (start_in_block + t) * token_stride
-                          + head_offset_in_token)
-                addr_list.append(addr_t)
-                size_list.append(head_dim_bytes)
+
+        # Byte sizes per dimension in the staging buffer
+        head_dim_bytes = self.head_dim * self.elem_size
+        # Staging layout: [total_kv, num_local_heads, block_size, head_dim]
+        head_stride = self.block_size * head_dim_bytes          # one head slot
+        kv_stride = self.num_local_heads * head_stride          # one KV tensor slot
+
+        for i in range(len(self.kv_caches_base_addr)):
+            addr = (self.staging_base_addr
+                    + i * kv_stride
+                    + head_local_idx * head_stride)
+            size = num_tokens * head_dim_bytes
+            addr_list.append(addr)
+            size_list.append(size)
         return addr_list, size_list, block_id
 
     def prepare_value_layer(self, start: int, end: int, block_ids: list[int], layer_id: int):
@@ -228,31 +318,32 @@ class ChunkedTokenDatabase:
                                      layer_id: int, head_local_idx: int):
         """Layer-wise version of prepare_value_per_head.
 
-        Same scatter-gather logic as prepare_value_per_head but selects the
-        base address via layer_id.  Returns one (addr, size) pair per token
-        per KV tensor so the caller can drive non-contiguous DMA correctly.
+        Returns staging-buffer addresses for a single head within one
+        layer's KV tensors.  The staging buffer (for layerwise mode) has
+        shape [num_kv_per_layer, num_local_heads, block_size, head_dim].
+
+        Callers must use ``permute_layer_block_to_staging`` /
+        ``permute_layer_staging_to_block`` around the DMA call.
         """
         block_id = block_ids[start // self.block_size]
         num_tokens = end - start
-        start_in_block = start % self.block_size
+
+        head_dim_bytes = self.head_dim * self.elem_size
+        head_stride = self.block_size * head_dim_bytes
+        kv_stride = self.num_local_heads * head_stride
+
         addr_list = []
         size_list = []
         bl_length = len(self.block_len)
-        sh_length = len(self.single_head_block_len)
         for i in range(bl_length):
-            full_block_len = self.block_len[i]
-            single_head_len = self.single_head_block_len[i % sh_length]
-            block_offset = block_id * full_block_len
-            token_stride = full_block_len // self.block_size
-            head_dim_bytes = single_head_len // self.block_size
-            head_offset_in_token = head_local_idx * head_dim_bytes
-            base_addr = self.kv_caches_base_addr[layer_id * bl_length + i]
-            for t in range(num_tokens):
-                addr_t = (base_addr + block_offset
-                          + (start_in_block + t) * token_stride
-                          + head_offset_in_token)
-                addr_list.append(addr_t)
-                size_list.append(head_dim_bytes)
+            # In layerwise mode the staging buffer only holds this layer's
+            # KV tensors, so index *i* maps to staging_buffer[i].
+            addr = (self.staging_base_addr
+                    + i * kv_stride
+                    + head_local_idx * head_stride)
+            size = num_tokens * head_dim_bytes
+            addr_list.append(addr)
+            size_list.append(size)
         return addr_list, size_list
 
     def process_tokens(

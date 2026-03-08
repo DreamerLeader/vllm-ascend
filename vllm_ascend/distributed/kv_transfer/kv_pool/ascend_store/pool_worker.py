@@ -238,13 +238,15 @@ class KVPoolWorker:
         self.token_database.set_kv_caches_base_addr(self.kv_caches_base_addr)
         self.token_database.set_block_len(self.block_len)
 
-        # Compute per-head block length for per-head key mode
+        # Compute per-head block length and set up staging buffer for
+        # per-head key mode.
         if self.per_head_keys and not self.use_mla and not self.use_sparse:
             # KV cache shape: [num_blocks, block_size, num_local_heads, head_dim]
-            # single_head_block_len = block_size * head_dim * element_size
-            #                       = full_block_len / num_local_heads
-            # NOTE: heads are at dim-2, so per-head data is NOT contiguous.
-            # prepare_value_per_head uses scatter-gather (one addr per token).
+            # Within each block the physical layout is
+            #   [block_size, num_local_heads, head_dim]
+            # so per-head data is NOT contiguous across tokens.  A staging
+            # buffer with layout [num_local_heads, block_size, head_dim] is
+            # used to permute data before/after DMA transfer.
             single_head_block_len = []
             for bl in self.block_len:
                 if self.num_local_heads > 0:
@@ -252,8 +254,53 @@ class KVPoolWorker:
                 else:
                     single_head_block_len.append(bl)
             self.token_database.set_single_head_block_len(single_head_block_len)
+
+            # Extract head_dim and elem_size from the first KV cache tensor
+            head_dim = first_kv_cache.shape[-1]
+            elem_size = first_kv_cache.element_size()
+            num_kv_per_layer = len(first_kv_cache_tuple)
+
+            # Collect KV cache tensor references (same order as
+            # kv_caches_base_addr)
+            kv_cache_tensors = []
+            for cache_or_caches in kv_caches.values():
+                for cache in cache_or_caches:
+                    kv_cache_tensors.append(cache)
+
+            # Allocate staging buffer.
+            # Non-layerwise: holds one block for ALL KV tensors across
+            #   all layers → shape [total_kv_tensors, num_local_heads,
+            #                        block_size, head_dim]
+            # Layerwise: holds one block for one layer's KV tensors
+            #   → shape [num_kv_per_layer, num_local_heads,
+            #             block_size, head_dim]
+            if self.use_layerwise:
+                staging_slots = num_kv_per_layer
+            else:
+                staging_slots = len(kv_cache_tensors)
+
+            staging_buffer = torch.empty(
+                (staging_slots, self.num_local_heads,
+                 self.original_block_size, head_dim),
+                dtype=first_kv_cache.dtype,
+                device=first_kv_cache.device,
+            )
+
+            # Register the staging buffer with the DMA backend
+            staging_ptr = staging_buffer.data_ptr()
+            staging_len = staging_buffer.numel() * elem_size
+            self.m_store.register_buffer([staging_ptr], [staging_len])
+
+            # Wire everything into the token database
+            self.token_database.set_staging_info(
+                staging_buffer, kv_cache_tensors,
+                head_dim, elem_size, num_kv_per_layer,
+            )
+
             logger.info(
-                "Per-head block lengths: full=%s, per_head=%s, num_local_heads=%d",
+                "Per-head staging buffer allocated: shape=%s, "
+                "full_block_len=%s, per_head_len=%s, num_local_heads=%d",
+                list(staging_buffer.shape),
                 self.block_len, single_head_block_len, self.num_local_heads,
             )
 
@@ -362,23 +409,35 @@ class KVPoolWorker:
         Each local head reads its own key from the store. This allows
         decode nodes (with different TP) to correctly load KV cache
         that was stored by prefill nodes (with different TP).
+
+        Because the KV cache layout is [block_size, num_heads, head_dim]
+        (per-head data non-contiguous), we must:
+        1. DMA into the staging buffer (heads-first, contiguous)
+        2. Permute from staging buffer back to KV cache
+        This is done one block at a time.
         """
         mask_num = request.load_spec.vllm_cached_tokens // self.block_size * self.block_size  # type: ignore[union-attr]
-        all_key_list = []
-        all_addr_list = []
-        all_size_list = []
         for start, end, head_keys, local_indices in self.token_database.process_tokens_per_head(
             token_len, request.block_hashes, mask_num
         ):
+            # Collect all heads' staging addresses for this block
+            block_keys = []
+            block_addrs = []
+            block_sizes = []
             for head_key, local_head_idx in zip(head_keys, local_indices):
                 addr, size, _ = self.token_database.prepare_value_per_head(
                     start, end, request.block_ids, local_head_idx
                 )
-                all_key_list.append(head_key.to_string())
-                all_addr_list.append(addr)
-                all_size_list.append(size)
-        if all_key_list:
-            self.m_store.get(all_key_list, all_addr_list, all_size_list)
+                block_keys.append(head_key.to_string())
+                block_addrs.append(addr)
+                block_sizes.append(size)
+
+            if block_keys:
+                # DMA into staging buffer
+                self.m_store.get(block_keys, block_addrs, block_sizes)
+                # Permute from staging buffer back to KV cache
+                block_id = request.block_ids[start // self.block_size]
+                self.token_database.permute_staging_to_block(block_id)
 
     def wait_for_layer_load(self) -> None:
         for layerwise_retriever in self.layerwise_retrievers:
