@@ -75,6 +75,7 @@ class KVPoolWorker:
             "consumer_is_to_put", False
         )
         self.backend = vllm_config.kv_transfer_config.kv_connector_extra_config.get("backend", "mooncake")
+        self.per_head_store = vllm_config.kv_transfer_config.kv_connector_extra_config.get("per_head_store", False)
         self.original_block_size = vllm_config.cache_config.block_size
         self.block_size = vllm_config.cache_config.block_size
 
@@ -87,6 +88,7 @@ class KVPoolWorker:
 
         if self.use_mla:
             self.num_kv_head = 1
+            self.per_head_store = False  # MLA uses single compressed head, no per-head split
         else:
             self.num_kv_head = model_config.get_total_num_kv_heads()
 
@@ -96,6 +98,16 @@ class KVPoolWorker:
         else:
             self.head_or_tp_rank = self.tp_rank
             self.put_step = 1
+
+        # Per-head store parameters for TP-unequal scenarios (non-MLA only)
+        if self.per_head_store and not self.use_mla:
+            self.total_num_kv_heads = model_config.get_total_num_kv_heads()
+            self.num_kv_heads_per_tp = model_config.get_num_kv_heads(parallel_config)
+            self.head_dim = model_config.get_head_size()
+        else:
+            self.num_kv_heads_per_tp = 1
+            self.head_dim = 0
+            self.total_num_kv_heads = self.num_kv_head
 
         self.metadata = KeyMetadata(
             model_config.model.rstrip("/").split("/")[-1],
@@ -197,6 +209,11 @@ class KVPoolWorker:
         self.token_database.set_kv_caches_base_addr(self.kv_caches_base_addr)
         self.token_database.set_block_len(self.block_len)
 
+        # Set per-head params for non-MLA per-head store mode
+        if self.per_head_store and not self.use_mla:
+            elem_size = first_kv_cache.element_size()
+            self.token_database.set_per_head_params(self.num_kv_heads_per_tp, self.head_dim, elem_size)
+
         if self.use_layerwise:
             self.get_event = threading.Event()
             if self.kv_role in ["kv_producer", "kv_both"]:
@@ -238,12 +255,23 @@ class KVPoolWorker:
                     self.kv_role,
                     ready_event_sending,
                     self.enable_kv_events,
+                    self.per_head_store,
+                    self.num_kv_heads_per_tp,
+                    self.total_num_kv_heads,
                 )
                 self.kv_send_thread.start()
             if self.load_async:
                 ready_event = threading.Event()
                 self.kv_recv_thread = KVCacheStoreRecvingThread(
-                    self.m_store, self.token_database, self.block_size, self.tp_rank, self.dcp_size, ready_event
+                    self.m_store,
+                    self.token_database,
+                    self.block_size,
+                    self.tp_rank,
+                    self.dcp_size,
+                    ready_event,
+                    self.per_head_store,
+                    self.num_kv_heads_per_tp,
+                    self.total_num_kv_heads,
                 )
                 self.kv_recv_thread.start()
                 ready_event.wait()
@@ -277,13 +305,33 @@ class KVPoolWorker:
                     size_list = []
                     key_list = []
                     mask_num = request.load_spec.vllm_cached_tokens // self.block_size * self.block_size
-                    for start, end, key in self.token_database.process_tokens(
-                        token_len, request.block_hashes, mask_num
-                    ):
-                        addr, size, _ = self.token_database.prepare_value(start, end, request.block_ids)
-                        key_list.append(key.to_string())
-                        addr_list.append(addr)
-                        size_list.append(size)
+                    if self.per_head_store and self.num_kv_heads_per_tp > 1:
+                        # Per-head loading: load each head separately
+                        for start, end, key in self.token_database.process_tokens(
+                            token_len, request.block_hashes, mask_num
+                        ):
+                            base_key_str = key.to_string()
+                            for local_h in range(self.num_kv_heads_per_tp):
+                                global_h = self.tp_rank * self.num_kv_heads_per_tp + local_h
+                                head_key = base_key_str.replace(
+                                    f"@head_or_tp_rank:{self.head_or_tp_rank}",
+                                    f"@head_or_tp_rank:{global_h}",
+                                    1,
+                                )
+                                addr, size, _ = self.token_database.prepare_value_per_head(
+                                    start, end, request.block_ids, local_h
+                                )
+                                key_list.append(head_key)
+                                addr_list.append(addr)
+                                size_list.append(size)
+                    else:
+                        for start, end, key in self.token_database.process_tokens(
+                            token_len, request.block_hashes, mask_num
+                        ):
+                            addr, size, _ = self.token_database.prepare_value(start, end, request.block_ids)
+                            key_list.append(key.to_string())
+                            addr_list.append(addr)
+                            size_list.append(size)
                     key_list_c = key_list[self.tp_rank % len(key_list) :] + key_list[: self.tp_rank % len(key_list)]
                     addr_list_c = (
                         addr_list[self.tp_rank % len(addr_list) :] + addr_list[: self.tp_rank % len(addr_list)]
@@ -595,7 +643,10 @@ class KVPoolWorker:
                 starts.append(start)
 
             multi_tp_keys = keys[:]
-            for i in range(1, min(self.tp_size, self.num_kv_head)):
+            # When per_head_store is enabled, check all global head indices;
+            # otherwise check min(tp_size, num_kv_head) entries as before.
+            num_head_keys = self.total_num_kv_heads if self.per_head_store else min(self.tp_size, self.num_kv_head)
+            for i in range(1, num_head_keys):
                 for item in keys:
                     new_str = item.replace(  # type: ignore[attr-defined]
                         "@head_or_tp_rank:0", f"@head_or_tp_rank:{i}", 1
@@ -616,7 +667,7 @@ class KVPoolWorker:
                 num_block = len(keys) // self.num_layers
             multi_tp_values = [
                 res[i * num_block : (i + 1) * num_block]  # type: ignore[index]
-                for i in range(min(self.tp_size, self.num_kv_head) * self.pp_size)
+                for i in range(num_head_keys * self.pp_size)
             ]
             index = self.find_min_first_non_one_index(multi_tp_values)
             if index != -1:

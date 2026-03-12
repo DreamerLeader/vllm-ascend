@@ -112,6 +112,20 @@ class ChunkedTokenDatabase:
     def set_block_len(self, block_len: list[int]):
         self.block_len = block_len
 
+    def set_per_head_params(self, num_kv_heads_per_tp: int, head_dim: int, elem_size: int):
+        """Set parameters needed for per-head KV cache storage.
+
+        Args:
+            num_kv_heads_per_tp: Number of KV heads per tensor parallel rank.
+            head_dim: Dimension of each attention head.
+            elem_size: Element size in bytes (e.g. 2 for float16).
+        """
+        self.num_kv_heads_per_tp = num_kv_heads_per_tp
+        self.head_dim = head_dim
+        self.elem_size = elem_size
+        self.head_size = head_dim * elem_size
+        self.token_stride = num_kv_heads_per_tp * head_dim * elem_size
+
     def prepare_value(self, start: int, end: int, block_ids: list[int]):
         addr_list = []
         size_list = []
@@ -122,6 +136,39 @@ class ChunkedTokenDatabase:
             size = int(self.block_len[index % length] / self.block_size * (end - start))
             addr_list.append(addr)
             size_list.append(size)
+        return addr_list, size_list, block_id
+
+    def prepare_value_per_head(self, start: int, end: int, block_ids: list[int], local_head_idx: int):
+        """Prepare per-head addresses for a block.
+
+        For non-MLA models with TP-unequal scenarios, compute the starting
+        address of a specific head at each token position within a block.
+        KV cache layout: [num_blocks, block_size, num_kv_heads_per_tp, head_dim]
+
+        Args:
+            start: Start token index (block-aligned).
+            end: End token index.
+            block_ids: Block ID mapping.
+            local_head_idx: Local head index within this TP rank.
+
+        Returns:
+            (addr_list, size_list, block_id) where addr_list contains
+            per-token-position addresses for the specified head across
+            all KV cache buffers (K and V per layer).
+        """
+        addr_list = []
+        size_list = []
+        block_id = block_ids[start // self.block_size]
+        num_tokens = end - start
+        length = len(self.block_len)
+
+        for index, base_addr in enumerate(self.kv_caches_base_addr):
+            block_start = base_addr + block_id * self.block_len[index % length]
+            for t in range(num_tokens):
+                addr = block_start + t * self.token_stride + local_head_idx * self.head_size
+                addr_list.append(addr)
+                size_list.append(self.head_size)
+
         return addr_list, size_list, block_id
 
     def prepare_value_layer(self, start: int, end: int, block_ids: list[int], layer_id: int):

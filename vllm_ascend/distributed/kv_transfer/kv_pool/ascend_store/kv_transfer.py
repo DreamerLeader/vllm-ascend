@@ -128,6 +128,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
         kv_role: str,
         ready_event: threading.Event,
         enable_kv_event: bool = False,
+        per_head_store: bool = False,
+        num_kv_heads_per_tp: int = 1,
+        total_num_kv_heads: int = 1,
     ):
         super().__init__(
             m_store, token_database, block_size, tp_rank, dcp_size, ready_event, name="KVCacheSendingThread"
@@ -136,6 +139,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.kv_role = kv_role
         self.stored_requests = defaultdict[str, int](int)
         self.enable_kv_event = enable_kv_event
+        self.per_head_store = per_head_store
+        self.num_kv_heads_per_tp = num_kv_heads_per_tp
+        self.total_num_kv_heads = total_num_kv_heads
 
     def add_stored_request(self, req_id: str):
         with self.done_task_lock:
@@ -175,6 +181,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
         if not keys:
             self.dec_stored_request(req_id)
+            return
+
+        # Per-head store: store each head separately with head-indexed keys
+        if self.per_head_store and self.num_kv_heads_per_tp > 1:
+            self._handle_per_head_store(req_meta, starts, ends, keys, block_ids, current_event, req_id)
             return
 
         skip_block_num = self.lookup(keys)
@@ -242,6 +253,77 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.dec_stored_request(req_id)
         self.request_queue.task_done()
 
+    def _handle_per_head_store(
+        self,
+        req_meta: ReqMeta,
+        starts: list[int],
+        ends: list[int],
+        keys: list[str],
+        block_ids: list[int],
+        current_event,
+        req_id: str,
+    ):
+        """Handle per-head KV cache storage for TP-unequal scenarios.
+
+        For non-MLA models, stores each head's KV cache separately with
+        the global head index as part of the key. The address_list for each
+        head contains per-token starting addresses within each block.
+        This ensures prefill with different TP can hit the stored cache.
+        """
+        # Determine which head_or_tp_rank is currently in the key
+        # (for num_kv_heads >= tp_size, head_or_tp_rank == tp_rank)
+        current_head_or_tp = self.token_database.metadata.head_or_tp_rank
+
+        # For each local head, create per-head keys and check existence
+        for local_h in range(self.num_kv_heads_per_tp):
+            global_h = self.tp_rank * self.num_kv_heads_per_tp + local_h
+            head_keys = []
+            for key_str in keys:
+                head_key = key_str.replace(
+                    f"@head_or_tp_rank:{current_head_or_tp}",
+                    f"@head_or_tp_rank:{global_h}",
+                    1,
+                )
+                head_keys.append(head_key)
+
+            # Skip blocks already stored for this head
+            skip_block_num = self.lookup(head_keys)
+            if skip_block_num == len(head_keys):
+                continue
+
+            head_keys = head_keys[skip_block_num:]
+            head_starts = starts[skip_block_num:]
+            head_ends = ends[skip_block_num:]
+
+            logger.debug(
+                "Per-head storing KV cache for head %d, %d out of %d blocks "
+                "(skip_block_num=%d) for request %s",
+                global_h,
+                len(head_keys),
+                len(keys),
+                skip_block_num,
+                req_id,
+            )
+
+            addrs = []
+            sizes = []
+            for index, start in enumerate(head_starts):
+                addr, size, _ = self.token_database.prepare_value_per_head(
+                    start, head_ends[index], block_ids, local_h
+                )
+                addrs.append(addr)
+                sizes.append(size)
+
+            if self.kv_role == "kv_consumer":
+                head_keys, addrs, sizes = self.token_database.decode_adaptor_prefill_pp(head_keys, addrs, sizes)
+
+            if current_event is not None:
+                current_event.synchronize()
+            self.m_store.put(head_keys, addrs, sizes)
+
+        self.dec_stored_request(req_id)
+        self.request_queue.task_done()
+
 
 class KVCacheStoreRecvingThread(KVTransferThread):
     def __init__(
@@ -252,10 +334,16 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         tp_rank: int,
         dcp_size: int,
         ready_event: threading.Event,
+        per_head_store: bool = False,
+        num_kv_heads_per_tp: int = 1,
+        total_num_kv_heads: int = 1,
     ):
         super().__init__(
             m_store, token_database, block_size, tp_rank, dcp_size, ready_event, name="KVCacheStoreRecvingThread"
         )
+        self.per_head_store = per_head_store
+        self.num_kv_heads_per_tp = num_kv_heads_per_tp
+        self.total_num_kv_heads = total_num_kv_heads
 
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
@@ -268,11 +356,32 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         addr_list = []
         size_list = []
         key_list = []
-        for start, end, key in self.token_database.process_tokens(token_len, req_meta.block_hashes, mask_num):
-            addr, size, _ = self.token_database.prepare_value(start, end, req_meta.block_ids)
-            key_list.append(key.to_string())
-            addr_list.append(addr)
-            size_list.append(size)
+
+        if self.per_head_store and self.num_kv_heads_per_tp > 1:
+            # Per-head loading: load each head separately
+            current_head_or_tp = self.token_database.metadata.head_or_tp_rank
+            for start, end, key in self.token_database.process_tokens(token_len, req_meta.block_hashes, mask_num):
+                base_key_str = key.to_string()
+                for local_h in range(self.num_kv_heads_per_tp):
+                    global_h = self.tp_rank * self.num_kv_heads_per_tp + local_h
+                    head_key = base_key_str.replace(
+                        f"@head_or_tp_rank:{current_head_or_tp}",
+                        f"@head_or_tp_rank:{global_h}",
+                        1,
+                    )
+                    addr, size, _ = self.token_database.prepare_value_per_head(
+                        start, end, req_meta.block_ids, local_h
+                    )
+                    key_list.append(head_key)
+                    addr_list.append(addr)
+                    size_list.append(size)
+        else:
+            for start, end, key in self.token_database.process_tokens(token_len, req_meta.block_hashes, mask_num):
+                addr, size, _ = self.token_database.prepare_value(start, end, req_meta.block_ids)
+                key_list.append(key.to_string())
+                addr_list.append(addr)
+                size_list.append(size)
+
         key_list_c = key_list[self.tp_rank % len(key_list) :] + key_list[: self.tp_rank % len(key_list)]
         addr_list_c = addr_list[self.tp_rank % len(addr_list) :] + addr_list[: self.tp_rank % len(addr_list)]
         size_list_c = size_list[self.tp_rank % len(size_list) :] + size_list[: self.tp_rank % len(size_list)]
