@@ -311,6 +311,9 @@ class KVPoolWorker:
                             token_len, request.block_hashes, mask_num
                         ):
                             base_key_str = key.to_string()
+                            all_head_addrs, all_head_sizes, _ = self.token_database.prepare_value_per_head(
+                                start, end, request.block_ids
+                            )
                             for local_h in range(self.num_kv_heads_per_tp):
                                 global_h = self.tp_rank * self.num_kv_heads_per_tp + local_h
                                 head_key = base_key_str.replace(
@@ -318,12 +321,9 @@ class KVPoolWorker:
                                     f"@head_or_tp_rank:{global_h}",
                                     1,
                                 )
-                                addr, size, _ = self.token_database.prepare_value_per_head(
-                                    start, end, request.block_ids, local_h
-                                )
                                 key_list.append(head_key)
-                                addr_list.append(addr)
-                                size_list.append(size)
+                                addr_list.append(all_head_addrs[local_h])
+                                size_list.append(all_head_sizes[local_h])
                     else:
                         for start, end, key in self.token_database.process_tokens(
                             token_len, request.block_hashes, mask_num

@@ -115,16 +115,30 @@ class ChunkedTokenDatabase:
     def set_per_head_params(self, num_kv_heads_per_tp: int, head_dim: int, elem_size: int):
         """Set parameters needed for per-head KV cache storage.
 
+        Computes byte-level strides and per-head base offsets based on the
+        row-major KV cache layout: [num_blocks, block_size, num_local_heads, head_dim].
+
+        Strides (in bytes):
+          - head_stride:  head_dim * elem_size             (offset to next head within same token)
+          - token_stride: num_local_heads * head_stride     (offset to next token within same block)
+          - block_stride: block_size * token_stride         (offset to next block, equals block_len)
+
         Args:
-            num_kv_heads_per_tp: Number of KV heads per tensor parallel rank.
+            num_kv_heads_per_tp: Number of KV heads per tensor parallel rank (num_local_heads).
             head_dim: Dimension of each attention head.
             elem_size: Element size in bytes (e.g. 2 for float16).
         """
         self.num_kv_heads_per_tp = num_kv_heads_per_tp
         self.head_dim = head_dim
         self.elem_size = elem_size
-        self.head_size = head_dim * elem_size
-        self.token_stride = num_kv_heads_per_tp * head_dim * elem_size
+
+        # Byte strides for [num_blocks, block_size, num_local_heads, head_dim]
+        self.head_stride = head_dim * elem_size
+        self.token_stride = num_kv_heads_per_tp * self.head_stride
+        self.block_stride = self.block_size * self.token_stride
+
+        # Pre-compute base byte offset for each local head
+        self.head_offsets = [h * self.head_stride for h in range(num_kv_heads_per_tp)]
 
     def prepare_value(self, start: int, end: int, block_ids: list[int]):
         addr_list = []
@@ -138,38 +152,70 @@ class ChunkedTokenDatabase:
             size_list.append(size)
         return addr_list, size_list, block_id
 
-    def prepare_value_per_head(self, start: int, end: int, block_ids: list[int], local_head_idx: int):
-        """Prepare per-head addresses for a block.
+    def _get_token_head_addr(self, base_addr: int, block_id: int, token_idx: int, head_idx: int) -> int:
+        """Compute the physical address of a specific (block, token, head) position.
 
-        For non-MLA models with TP-unequal scenarios, compute the starting
-        address of a specific head at each token position within a block.
-        KV cache layout: [num_blocks, block_size, num_kv_heads_per_tp, head_dim]
+        For KV cache layout [num_blocks, block_size, num_local_heads, head_dim]
+        stored in row-major order:
+            addr = base + block_id * block_stride + token_idx * token_stride + head_offsets[head_idx]
+
+        Args:
+            base_addr: Base address of the KV cache buffer.
+            block_id: Physical block index.
+            token_idx: Token offset within the block (0 .. block_size-1).
+            head_idx: Local head index within this TP rank.
+
+        Returns:
+            Physical byte address of the start of head_dim contiguous elements.
+        """
+        return (
+            base_addr
+            + block_id * self.block_stride
+            + token_idx * self.token_stride
+            + self.head_offsets[head_idx]
+        )
+
+    def prepare_value_per_head(
+        self, start: int, end: int, block_ids: list[int]
+    ) -> tuple[list[list[int]], list[list[int]], int]:
+        """Prepare per-head addresses for ALL local heads in a block range.
+
+        For non-MLA models with TP-unequal scenarios, computes the starting
+        address of each head at each token position within a block.
+        KV cache layout: [num_blocks, block_size, num_local_heads, head_dim]
+
+        For each local head h, and each token position t in [start, end),
+        the address is computed as:
+            base + block_id * block_stride + t * token_stride + head_offsets[h]
+        where each entry covers head_stride (= head_dim * elem_size) contiguous bytes.
 
         Args:
             start: Start token index (block-aligned).
             end: End token index.
-            block_ids: Block ID mapping.
-            local_head_idx: Local head index within this TP rank.
+            block_ids: Block ID mapping from logical block index to physical block ID.
 
         Returns:
-            (addr_list, size_list, block_id) where addr_list contains
-            per-token-position addresses for the specified head across
-            all KV cache buffers (K and V per layer).
+            (all_head_addrs, all_head_sizes, block_id) where:
+              - all_head_addrs[h]: list of addresses for local head h,
+                ordered as [buf0_t0, buf0_t1, ..., buf1_t0, buf1_t1, ...]
+                across all KV cache buffers (K and V per layer).
+              - all_head_sizes[h]: list of sizes (each = head_stride) matching addrs.
+              - block_id: the physical block ID used.
         """
-        addr_list = []
-        size_list = []
         block_id = block_ids[start // self.block_size]
         num_tokens = end - start
-        length = len(self.block_len)
 
-        for index, base_addr in enumerate(self.kv_caches_base_addr):
-            block_start = base_addr + block_id * self.block_len[index % length]
+        all_head_addrs: list[list[int]] = [[] for _ in range(self.num_kv_heads_per_tp)]
+        all_head_sizes: list[list[int]] = [[] for _ in range(self.num_kv_heads_per_tp)]
+
+        for base_addr in self.kv_caches_base_addr:
             for t in range(num_tokens):
-                addr = block_start + t * self.token_stride + local_head_idx * self.head_size
-                addr_list.append(addr)
-                size_list.append(self.head_size)
+                for h in range(self.num_kv_heads_per_tp):
+                    addr = self._get_token_head_addr(base_addr, block_id, t, h)
+                    all_head_addrs[h].append(addr)
+                    all_head_sizes[h].append(self.head_stride)
 
-        return addr_list, size_list, block_id
+        return all_head_addrs, all_head_sizes, block_id
 
     def prepare_value_layer(self, start: int, end: int, block_ids: list[int], layer_id: int):
         block_id = block_ids[start // self.block_size]
