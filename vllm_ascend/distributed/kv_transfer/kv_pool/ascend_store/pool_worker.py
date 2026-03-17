@@ -212,7 +212,7 @@ class KVPoolWorker:
         # Set per-head params for non-MLA per-head store mode
         if self.per_head_store and not self.use_mla:
             elem_size = first_kv_cache.element_size()
-            self.token_database.set_per_head_params(self.num_kv_heads_per_tp, self.head_dim, elem_size)
+            self.token_database.set_per_head_params(self.num_kv_heads_per_tp, self.head_dim, elem_size, self.tp_rank)
 
         if self.use_layerwise:
             self.get_event = threading.Event()
@@ -311,19 +311,12 @@ class KVPoolWorker:
                             token_len, request.block_hashes, mask_num
                         ):
                             base_key_str = key.to_string()
-                            all_head_addrs, all_head_sizes, _ = self.token_database.prepare_value_per_head(
-                                start, end, request.block_ids
+                            head_keys, head_addrs, head_sizes, _ = self.token_database.prepare_value_per_head(
+                                start, end, request.block_ids, base_key_str
                             )
-                            for local_h in range(self.num_kv_heads_per_tp):
-                                global_h = self.tp_rank * self.num_kv_heads_per_tp + local_h
-                                head_key = base_key_str.replace(
-                                    f"@head_or_tp_rank:{self.head_or_tp_rank}",
-                                    f"@head_or_tp_rank:{global_h}",
-                                    1,
-                                )
-                                key_list.append(head_key)
-                                addr_list.append(all_head_addrs[local_h])
-                                size_list.append(all_head_sizes[local_h])
+                            key_list.extend(head_keys)
+                            addr_list.extend(head_addrs)
+                            size_list.extend(head_sizes)
                     else:
                         for start, end, key in self.token_database.process_tokens(
                             token_len, request.block_hashes, mask_num

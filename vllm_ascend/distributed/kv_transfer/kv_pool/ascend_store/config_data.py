@@ -112,7 +112,7 @@ class ChunkedTokenDatabase:
     def set_block_len(self, block_len: list[int]):
         self.block_len = block_len
 
-    def set_per_head_params(self, num_kv_heads_per_tp: int, head_dim: int, elem_size: int):
+    def set_per_head_params(self, num_kv_heads_per_tp: int, head_dim: int, elem_size: int, tp_rank: int = 0):
         """Set parameters needed for per-head KV cache storage.
 
         Computes byte-level strides and per-head base offsets based on the
@@ -127,10 +127,12 @@ class ChunkedTokenDatabase:
             num_kv_heads_per_tp: Number of KV heads per tensor parallel rank (num_local_heads).
             head_dim: Dimension of each attention head.
             elem_size: Element size in bytes (e.g. 2 for float16).
+            tp_rank: Tensor parallel rank, used for computing global head indices.
         """
         self.num_kv_heads_per_tp = num_kv_heads_per_tp
         self.head_dim = head_dim
         self.elem_size = elem_size
+        self.tp_rank = tp_rank
 
         # Byte strides for [num_blocks, block_size, num_local_heads, head_dim]
         self.head_stride = head_dim * elem_size
@@ -139,6 +141,26 @@ class ChunkedTokenDatabase:
 
         # Pre-compute base byte offset for each local head
         self.head_offsets = [h * self.head_stride for h in range(num_kv_heads_per_tp)]
+
+    def generate_per_head_key(self, base_key_str: str, local_h: int) -> str:
+        """Generate a unique key for a specific local head.
+
+        Replaces head_or_tp_rank in the base key string with the global head
+        index, ensuring each head has a globally unique key across all TP ranks.
+
+        Args:
+            base_key_str: Base key string from PoolKey.to_string().
+            local_h: Local head index within this TP rank (0 .. num_kv_heads_per_tp-1).
+
+        Returns:
+            Key string with global head index embedded.
+        """
+        global_h = self.tp_rank * self.num_kv_heads_per_tp + local_h
+        return base_key_str.replace(
+            f"@head_or_tp_rank:{self.metadata.head_or_tp_rank}",
+            f"@head_or_tp_rank:{global_h}",
+            1,
+        )
 
     def prepare_value(self, start: int, end: int, block_ids: list[int]):
         addr_list = []
@@ -176,46 +198,80 @@ class ChunkedTokenDatabase:
         )
 
     def prepare_value_per_head(
-        self, start: int, end: int, block_ids: list[int]
-    ) -> tuple[list[list[int]], list[list[int]], int]:
-        """Prepare per-head addresses for ALL local heads in a block range.
+        self, start: int, end: int, block_ids: list[int], base_key_str: str,
+    ) -> tuple[list[str], list[list[int]], list[list[int]], int]:
+        """Prepare per-head keys, addresses, and sizes for put/get operations.
 
-        For non-MLA models with TP-unequal scenarios, computes the starting
-        address of each head at each token position within a block.
+        For non-MLA models with TP-unequal scenarios, generates the complete
+        parameter lists that can be directly passed to backend put/get calls.
+        Both K cache and V cache are split by head, since kv_caches_base_addr
+        contains base addresses for all K and V buffers across all layers.
+
         KV cache layout: [num_blocks, block_size, num_local_heads, head_dim]
+        Stored in row-major (C-contiguous) order.
 
-        For each local head h, and each token position t in [start, end),
-        the address is computed as:
-            base + block_id * block_stride + t * token_stride + head_offsets[h]
-        where each entry covers head_stride (= head_dim * elem_size) contiguous bytes.
+        Strides (in bytes):
+          - head_stride  = head_dim * elem_size
+          - token_stride = num_local_heads * head_stride
+          - block_stride = block_size * token_stride
+
+        For each KV buffer (K and V per layer), each token t in [start, end),
+        and each local head h, the physical address is:
+            base + block_id * block_stride
+                 + (token_offset + t) * token_stride
+                 + h * head_stride
+
+        where token_offset = start % block_size accounts for non-block-aligned
+        start positions (e.g. in decode save scenarios).
+
+        Key generation: Each head gets a globally unique key by embedding the
+        global head index (tp_rank * num_kv_heads_per_tp + local_h) into the
+        base key string via the @head_or_tp_rank field.
 
         Args:
-            start: Start token index (block-aligned).
+            start: Start token index.
             end: End token index.
             block_ids: Block ID mapping from logical block index to physical block ID.
+            base_key_str: Base key string from PoolKey.to_string(), used to
+                generate per-head keys via generate_per_head_key().
 
         Returns:
-            (all_head_addrs, all_head_sizes, block_id) where:
-              - all_head_addrs[h]: list of addresses for local head h,
-                ordered as [buf0_t0, buf0_t1, ..., buf1_t0, buf1_t1, ...]
-                across all KV cache buffers (K and V per layer).
-              - all_head_sizes[h]: list of sizes (each = head_stride) matching addrs.
+            (per_head_keys, per_head_addrs, per_head_sizes, block_id) where:
+              - per_head_keys[h]: unique key string for local head h.
+              - per_head_addrs[h]: list of physical addresses for head h,
+                ordered as [K_layer0_t0, K_layer0_t1, ..., V_layer0_t0, ...,
+                K_layer1_t0, ...] across all KV cache buffers.
+              - per_head_sizes[h]: list of sizes (each = head_stride) matching addrs.
               - block_id: the physical block ID used.
         """
         block_id = block_ids[start // self.block_size]
         num_tokens = end - start
+        # Token offset within the block; 0 when start is block-aligned.
+        token_offset = start % self.block_size
 
-        all_head_addrs: list[list[int]] = [[] for _ in range(self.num_kv_heads_per_tp)]
-        all_head_sizes: list[list[int]] = [[] for _ in range(self.num_kv_heads_per_tp)]
+        per_head_keys: list[str] = []
+        per_head_addrs: list[list[int]] = []
+        per_head_sizes: list[list[int]] = []
 
-        for base_addr in self.kv_caches_base_addr:
-            for t in range(num_tokens):
-                for h in range(self.num_kv_heads_per_tp):
-                    addr = self._get_token_head_addr(base_addr, block_id, t, h)
-                    all_head_addrs[h].append(addr)
-                    all_head_sizes[h].append(self.head_stride)
+        for h in range(self.num_kv_heads_per_tp):
+            # Generate globally unique key for this head
+            per_head_keys.append(self.generate_per_head_key(base_key_str, h))
 
-        return all_head_addrs, all_head_sizes, block_id
+            head_addrs: list[int] = []
+            head_sizes: list[int] = []
+
+            # Iterate all KV buffers (K and V for each layer)
+            for base_addr in self.kv_caches_base_addr:
+                block_base = base_addr + block_id * self.block_stride
+                for t in range(num_tokens):
+                    addr = block_base + (token_offset + t) * self.token_stride + self.head_offsets[h]
+                    head_addrs.append(addr)
+                    head_sizes.append(self.head_stride)
+
+            per_head_addrs.append(head_addrs)
+            per_head_sizes.append(head_sizes)
+
+        return per_head_keys, per_head_addrs, per_head_sizes, block_id
 
     def prepare_value_layer(self, start: int, end: int, block_ids: list[int], layer_id: int):
         block_id = block_ids[start // self.block_size]
