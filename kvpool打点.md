@@ -1,108 +1,59 @@
+# Ascend Store 池化代码耗时打点位置
 
-  池化请求查询时间
+本文档整理 `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store` 路径下池化代码中建议打点的位置，重点覆盖：
 
-  ┌────────────────────────────────────────────────────────────────────────────────────────┬────────────────────────────────────────────┬────────────────────┬────────────────────┬───────────────────────────┐
-  │ 文件                                                                                   │ 方法                                       │ 打点位置           │ 关键变量           │ 建议耗时变量名            │
-  ├────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────┼────────────────────┼────────────────────┼───────────────────────────┤
-  │ vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py:201         │ KVPoolScheduler.get_num_new_matched_tokens │ self.client.lookup │ request.request_id │ lookup_elapsed_ms         │
-  │                                                                                        │                                            │ (...) 前后         │ , token_len,       │                           │
-  │                                                                                        │                                            │                    │ request.block_hash │                           │
-  │                                                                                        │                                            │                    │ es,                │                           │
-  │                                                                                        │                                            │                    │ self.kv_cache_grou │                           │
-  │                                                                                        │                                            │                    │ p_ids,             │                           │
-  │                                                                                        │                                            │                    │ num_external_hit_t │                           │
-  │                                                                                        │                                            │                    │ okens              │                           │
-  │ vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py:561         │ LookupKeyClient.lookup                     │ send_multipart 到  │ token_len,         │ lookup_rpc_elapsed_ms     │
-  │                                                                                        │                                            │ recv 前后          │ block_hashes,      │                           │
-  │                                                                                        │                                            │                    │ kv_cache_group_ids │                           │
-  │                                                                                        │                                            │                    │ , result           │                           │
-  │ vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py:276 │ LookupKeyServer.process_request 内部函数   │ self.pool_worker.l │ token_len,         │ lookup_server_elapsed_ms  │
-  │                                                                                        │                                            │ ookup_scheduler(.. │ kv_group_ids,      │                           │
-  │                                                                                        │                                            │ .) 前后            │ hashes_str, result │                           │
-  │ vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py:894            │ KVPoolWorker.lookup_scheduler              │ self.m_store.exist │ group_id, keys,    │ backend_exists_elapsed_ms │
-  │                                                                                        │                                            │ s(multi_tp_keys)   │ multi_tp_keys,     │                           │
-  │                                                                                        │                                            │ 前后               │ res,               │                           │
-  │                                                                                        │                                            │                    │ first_missing,     │                           │
-  │                                                                                        │                                            │                    │ hits               │                           │
-  │ vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py:785            │ KVPoolWorker.lookup                        │ self.m_store.exist │ group_id, keys,    │ backend_exists_elapsed_ms │
-  │                                                                                        │                                            │ s(keys) 前后       │ res, hits          │                           │
-  │ vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py:96             │ KVTransferThread.lookup                    │ self.m_store.exist │ keys, res,         │ store_exists_elapsed_ms   │
-  │                                                                                        │                                            │ s(keys) 前后       │ exists_list        │                           │
-  └────────────────────────────────────────────────────────────────────────────────────────┴────────────────────────────────────────────┴────────────────────┴────────────────────┴───────────────────────────┘
+- 池化请求查询时间
+- KVCache 读取时间
+- KVCache 存储时间
+- 后端真实读写耗时
 
-  KVCache 读取时间
+建议统一使用 `time.perf_counter()` 计时，变量命名采用 `*_start_time` 和 `*_elapsed_ms`。
 
-  ┌─────────────────────────────────────────────────────────────────────────────┬────────────────────────────────────────────────┬────────────────────────┬─────────────────────────┬─────────────────────────┐
-  │ 文件                                                                        │ 方法                                           │ 打点位置               │ 关键变量                │ 建议耗时变量名          │
-  ├─────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────┼────────────────────────┼─────────────────────────┼─────────────────────────┤
-  │ vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py:433 │ KVPoolWorker.start_load_kv                     │ 同步路径               │ request.req_id,         │ kv_get_elapsed_ms       │
-  │                                                                             │                                                │ self.m_store.get(key_l │ token_len,              │                         │
-  │                                                                             │                                                │ ist_c, addr_list_c,    │ load_group_ids,         │                         │
-  │                                                                             │                                                │ size_list_c) 前后      │ key_list_c,             │                         │
-  │                                                                             │                                                │                        │ addr_list_c,            │                         │
-  │                                                                             │                                                │                        │ size_list_c             │                         │
-  │ vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py:384 │ KVCacheStoreRecvingThread._handle_request      │ 异步路径               │ req_id, token_len,      │ kv_get_elapsed_ms       │
-  │                                                                             │                                                │ self.m_store.get(key_l │ req_meta.kv_cache_group │                         │
-  │                                                                             │                                                │ ist_c, addr_list_c,    │ _ids, key_list_c,       │                         │
-  │                                                                             │                                                │ size_list_c) 前后      │ addr_list_c,            │                         │
-  │                                                                             │                                                │                        │ size_list_c             │                         │
-  │ vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py:550 │ KVCacheStoreLayerRecvingThread._handle_request │ layerwise 路径         │ req_meta.req_id,        │ layer_kv_get_elapsed_ms │
-  │                                                                             │                                                │ self.m_store.get(...)  │ req_meta.layer_id,      │                         │
-  │                                                                             │                                                │ 前后                   │ key_list_c,             │                         │
-  │                                                                             │                                                │                        │ addr_list_c,            │                         │
-  │                                                                             │                                                │                        │ size_list_c             │                         │
-  └─────────────────────────────────────────────────────────────────────────────┴────────────────────────────────────────────────┴────────────────────────┴─────────────────────────┴─────────────────────────┘
+## 池化请求查询时间
 
-  KVCache 存储时间
+| 文件 | 方法 | 打点位置 | 关键变量 | 建议耗时变量名 |
+|---|---|---|---|---|
+| `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py` | `KVPoolScheduler.get_num_new_matched_tokens` | `self.client.lookup(...)` 前后 | `request.request_id`, `token_len`, `request.block_hashes`, `self.kv_cache_group_ids`, `num_external_hit_tokens` | `lookup_elapsed_ms` |
+| `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py` | `LookupKeyClient.lookup` | `send_multipart` 到 `recv` 前后 | `token_len`, `block_hashes`, `kv_cache_group_ids`, `result` | `lookup_rpc_elapsed_ms` |
+| `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py` | `LookupKeyServer.process_request` 内部函数 | `self.pool_worker.lookup_scheduler(...)` 前后 | `token_len`, `kv_group_ids`, `hashes_str`, `result` | `lookup_server_elapsed_ms` |
+| `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py` | `KVPoolWorker.lookup_scheduler` | `self.m_store.exists(multi_tp_keys)` 前后 | `group_id`, `keys`, `multi_tp_keys`, `res`, `first_missing`, `hits` | `backend_exists_elapsed_ms` |
+| `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py` | `KVPoolWorker.lookup` | `self.m_store.exists(keys)` 前后 | `group_id`, `keys`, `res`, `hits` | `backend_exists_elapsed_ms` |
+| `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py` | `KVTransferThread.lookup` | `self.m_store.exists(keys)` 前后 | `keys`, `res`, `exists_list` | `store_exists_elapsed_ms` |
 
-  ┌─────────────────────────────────────────────────────────────────────────────┬────────────────────────────────────────────────┬──────────┬──────────┬──────────────────────────────────────────────────────┐
-  │ 文件                                                                        │ 方法                                           │ 打点位置 │ 关键变量 │ 建议耗时变量名                                       │
-  ├─────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────┼──────────┼──────────┼──────────────────────────────────────────────────────┤
-  │ vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py:244 │ KVCacheStoreSendingThread._handle_request      │ current_ │ req_id,  │ event_sync_elapsed_ms, kv_put_elapsed_ms             │
-  │                                                                             │                                                │ event.sy │ group_id │                                                      │
-  │                                                                             │                                                │ nchroniz │ , keys,  │                                                      │
-  │                                                                             │                                                │ e() 和   │ addrs,   │                                                      │
-  │                                                                             │                                                │ self.m_s │ sizes,   │                                                      │
-  │                                                                             │                                                │ tore.put │ missing_ │                                                      │
-  │                                                                             │                                                │ (keys,   │ indices, │                                                      │
-  │                                                                             │                                                │ addrs,   │ current_ │                                                      │
-  │                                                                             │                                                │ sizes)   │ event    │                                                      │
-  │                                                                             │                                                │ 分别打点 │          │                                                      │
-  │ vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py:467 │ KVCacheStoreLayerSendingThread._handle_request │ current_ │ req_meta │ layer_event_sync_elapsed_ms, layer_kv_put_elapsed_ms │
-  │                                                                             │                                                │ event.sy │ .req_id, │                                                      │
-  │                                                                             │                                                │ nchroniz │ layer_id │                                                      │
-  │                                                                             │                                                │ e() 和   │ ,        │                                                      │
-  │                                                                             │                                                │ self.m_s │ key_list │                                                      │
-  │                                                                             │                                                │ tore.put │ ,        │                                                      │
-  │                                                                             │                                                │ (key_lis │ addr_lis │                                                      │
-  │                                                                             │                                                │ t,       │ t,       │                                                      │
-  │                                                                             │                                                │ addr_lis │ size_lis │                                                      │
-  │                                                                             │                                                │ t,       │ t,       │                                                      │
-  │                                                                             │                                                │ size_lis │ missing_ │                                                      │
-  │                                                                             │                                                │ t) 分别  │ indices, │                                                      │
-  │                                                                             │                                                │ 打点     │ current_ │                                                      │
-  │                                                                             │                                                │          │ event    │                                                      │
-  │ vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py:563 │ KVPoolWorker.wait_for_save                     │ self.kv_ │ has_save │ wait_for_save_elapsed_ms                             │
-  │                                                                             │                                                │ send_thr │ _request │                                                      │
-  │                                                                             │                                                │ ead.requ │ ,        │                                                      │
-  │                                                                             │                                                │ est_queu │ connecto │                                                      │
-  │                                                                             │                                                │ e.join() │ r_metada │                                                      │
-  │                                                                             │                                                │ 前后     │ ta.reque │                                                      │
-  │                                                                             │                                                │          │ sts      │                                                      │
-  └─────────────────────────────────────────────────────────────────────────────┴────────────────────────────────────────────────┴──────────┴──────────┴──────────────────────────────────────────────────────┘
+## KVCache 读取时间
 
-  后端真实读写耗时
+| 文件 | 方法 | 打点位置 | 关键变量 | 建议耗时变量名 |
+|---|---|---|---|---|
+| `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py` | `KVPoolWorker.start_load_kv` | 同步路径 `self.m_store.get(key_list_c, addr_list_c, size_list_c)` 前后 | `request.req_id`, `token_len`, `load_group_ids`, `key_list_c`, `addr_list_c`, `size_list_c` | `kv_get_elapsed_ms` |
+| `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py` | `KVCacheStoreRecvingThread._handle_request` | 异步路径 `self.m_store.get(key_list_c, addr_list_c, size_list_c)` 前后 | `req_id`, `token_len`, `req_meta.kv_cache_group_ids`, `key_list_c`, `addr_list_c`, `size_list_c` | `kv_get_elapsed_ms` |
+| `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py` | `KVCacheStoreLayerRecvingThread._handle_request` | layerwise 路径 `self.m_store.get(...)` 前后 | `req_meta.req_id`, `req_meta.layer_id`, `key_list_c`, `addr_list_c`, `size_list_c` | `layer_kv_get_elapsed_ms` |
 
-  如果希望只统计后端库调用本身，而不包含 key/address 构造耗时，在 backend 里打点：
+## KVCache 存储时间
 
-  ┌──────────────────────────────────────────────────────────────────────────────────────────┬────────────────┬─────────────────────────────────────────────────┬─────────────────────────────────────────────┐
-  │ 文件                                                                                     │ 方法           │ 实际后端调用                                    │ 关键变量                                    │
-  ├──────────────────────────────────────────────────────────────────────────────────────────┼────────────────┼─────────────────────────────────────────────────┼─────────────────────────────────────────────┤
-  │ vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/memcache_backend.py:59  │ exists/get/put │ batch_is_exist, batch_get_into_layers,          │ keys/key, addr, size, res                   │
-  │                                                                                          │                │ batch_put_from_layers                           │                                             │
-  │ vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py:80  │ exists/get/put │ batch_is_exist, batch_get_into_multi_buffers,   │ keys, addrs, sizes, res/res_list            │
-  │                                                                                          │                │ batch_put_from_multi_buffers                    │                                             │
-  │ vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py:133 │ exists/get/put │ exist, mget_h2d, mset_d2h                       │ keys, addrs, sizes, blob_lists, failed_keys │
-  └──────────────────────────────────────────────────────────────────────────────────────────┴────────────────┴─────────────────────────────────────────────────┴─────────────────────────────────────────────┘
+| 文件 | 方法 | 打点位置 | 关键变量 | 建议耗时变量名 |
+|---|---|---|---|---|
+| `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py` | `KVCacheStoreSendingThread._handle_request` | `current_event.synchronize()` 和 `self.m_store.put(keys, addrs, sizes)` 分别打点 | `req_id`, `group_id`, `keys`, `addrs`, `sizes`, `missing_indices`, `current_event` | `event_sync_elapsed_ms`, `kv_put_elapsed_ms` |
+| `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py` | `KVCacheStoreLayerSendingThread._handle_request` | `current_event.synchronize()` 和 `self.m_store.put(key_list, addr_list, size_list)` 分别打点 | `req_meta.req_id`, `layer_id`, `key_list`, `addr_list`, `size_list`, `missing_indices`, `current_event` | `layer_event_sync_elapsed_ms`, `layer_kv_put_elapsed_ms` |
+| `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py` | `KVPoolWorker.wait_for_save` | `self.kv_send_thread.request_queue.join()` 前后 | `has_save_request`, `connector_metadata.requests` | `wait_for_save_elapsed_ms` |
 
-  建议命名统一用 *_start_time 和 *_elapsed_ms，计时用 time.perf_counter()。上层 kv_transfer.py/pool_worker.py 的打点能反映请求端感知耗时；backend 打点能反映具体存储后端调用耗时。
+## 后端真实读写耗时
+
+如果只统计后端库调用本身，而不包含 key/address 构造耗时，建议在 backend 实现里打点。
+
+| 文件 | 方法 | 实际后端调用 | 关键变量 |
+|---|---|---|---|
+| `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/memcache_backend.py` | `exists/get/put` | `batch_is_exist`, `batch_get_into_layers`, `batch_put_from_layers` | `keys/key`, `addr`, `size`, `res` |
+| `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py` | `exists/get/put` | `batch_is_exist`, `batch_get_into_multi_buffers`, `batch_put_from_multi_buffers` | `keys`, `addrs`, `sizes`, `res/res_list` |
+| `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py` | `exists/get/put` | `exist`, `mget_h2d`, `mset_d2h` | `keys`, `addrs`, `sizes`, `blob_lists`, `failed_keys` |
+
+## 打点层级建议
+
+上层 `kv_transfer.py` 和 `pool_worker.py` 的打点用于观察请求端感知耗时，包含 key 生成、地址准备、队列等待、NPU event 同步等上下文开销。
+
+backend 目录下的打点用于观察具体存储后端调用耗时，适合区分 Mooncake、Memcache、Yuanrong 等后端自身的读写和查询开销。
+
+推荐同时保留两层打点：
+
+- 上层打点：定位业务请求整体耗时。
+- backend 打点：定位具体后端库调用耗时。
+
