@@ -1,0 +1,32 @@
+I20260527 00:27:06.748560 532550 transfer_executor_base.cpp:269] Connected to segment: 80.5.17.112:20961
+(Worker_DP0_TP0_EP0 pid=522061) INFO 05-27 00:27:06 [kv_transfer.py:297] Storing KV cache for 2048 out of 128 blocks (missing_count=2048) for request cmpl-9f7ff57b9834c586-0-9db43651 in group 4
+(Worker_DP0_TP0_EP0 pid=522061) INFO 05-27 00:27:06 [kv_transfer.py:297] Storing KV cache for 512 out of 128 blocks (missing_count=512) for request cmpl-9f7ff57b9834c586-0-9db43651 in group 5
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962] WorkerProc hit an exception.
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962] Traceback (most recent call last):
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]   File "/home/f30058701/0525/vllm/vllm/v1/executor/multiproc_executor.py", line 957, in worker_busy_loop
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]     output = func(*args, **kwargs)
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]              ^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]   File "/home/f30058701/0525/vllm/vllm/v1/worker/worker_base.py", line 337, in execute_model
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]     return self.worker.execute_model(scheduler_output)
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]   File "/home/f30058701/0525/vllm-ascend/vllm_ascend/worker/worker.py", line 434, in execute_model
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]     output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]     return func(*args, **kwargs)
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]   File "/home/f30058701/0525/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 1872, in execute_model
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]     (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]                                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]   File "/home/f30058701/0525/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 2935, in _build_attention_metadata
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]     _build_attn_group_metadata(
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]   File "/home/f30058701/0525/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 2869, in _build_attn_group_metadata
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]     attn_metadata_i = builder.build(
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]                       ^^^^^^^^^^^^^^
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]   File "/home/f30058701/0525/vllm-ascend/vllm_ascend/attention/dsa_v1.py", line 500, in build
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]     decode_metadata = self.build_decode_metadata(common_prefix_len, common_attn_metadata, num_reqs_actual)
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]   File "/home/f30058701/0525/vllm-ascend/vllm_ascend/attention/dsa_v1.py", line 796, in build_decode_metadata
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]     input_positions_cpu = common_attn_metadata.positions_cpu[: self.num_decode_tokens].long()
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962]                           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_TP3_EP3 pid=522767) ERROR 05-27 00:27:08 [multiproc_executor.py:962] TypeError: 'builtin_function_or_method' object is not subscriptable
