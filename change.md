@@ -35,6 +35,11 @@ positions=self.positions.gpu if hasattr(self.positions, "gpu") else self.positio
 positions_cpu=self.positions.cpu if hasattr(self.positions, "cpu") else (
     self._positions_cpu_buf[:num_tokens] if self.use_compress else None
 ),
+positions_cpu=(
+    self._positions_cpu_buf[:num_tokens_padded]
+    if self.use_compress
+    else None
+),
 ```
 
 关键是：`positions_cpu` 不能再用 `self.positions.cpu()`，这个是实时 D2H sync。
