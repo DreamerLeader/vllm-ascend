@@ -1,0 +1,14 @@
+在 vllm-ascend 的池化路径里，我没有看到“事件对象跨进程共享/跨进程同步”的实现；看到的是两类东西：
+
+  1. 线程内同步
+     ascend_store 里大量用的是 threading.Event，例如 worker 启动/ready、layerwise recv 的 get_event，都只在同一进程内的线程之间同步。可看 vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/
+     pool_worker.py:383 和 vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py:78。
+  2. 设备流同步
+     current_event 是 torch.npu.Event()，在 save_kv_layer / wait_for_save 里先 record()，发送线程里再 synchronize()，这是 NPU stream 的同步，不是跨进程事件同步。对应位置在 vllm-ascend/vllm_ascend/
+     distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py:540 和 vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py:358。
+  3. 跨进程通信是 RPC，不是事件
+     scheduler 到 worker 的交互是 ipc://... 的 ZMQ lookup RPC，比如 vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py:647 和
+     vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py:193。这传的是请求/响应和状态，不是 event handle。
+     同样，finished_recving_kv_req_ids 也是通过 scheduler 输出状态回传，不是跨进程事件对象。
+
+  结论：kv_pool 这块没有发现跨进程事件同步逻辑，只有线程级和设备流级同步，跨进程部分主要是 ZMQ IPC 和状态回传。
