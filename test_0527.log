@@ -1,0 +1,82 @@
+Update(vllm_ascend/attention/dsa_v1.py)
+  ⎿  Added 17 lines
+      596  
+      597          if self.prefill_ratio_to_sas_metadata.get("prefill_input_positions", None) is None:
+      598              input_positions = common_attn_metadata.positions[: self.num_actual_tokens].long()
+      599 +            # CPU mirror of positions is required to keep mask/index/.shape()                                                                                                                
+      600 +            # off the NPU under ASCEND_ENABLE_USE_FABRIC_MEM=1, where any host                                                                                                               
+      601 +            # sync deadlocks the dispatcher.                                                                                                                                                 
+      602 +            input_positions_cpu = (                                                                                                                                                          
+      603 +                common_attn_metadata.positions_cpu[: self.num_actual_tokens].long()                                                                                                          
+      604 +                if common_attn_metadata.positions_cpu is not None                                                                                                                            
+      605 +                else None                                                                                                                                                                    
+      606 +            )                                                                                                                                                                                
+      607              max_query_len = self.query_lens[reqs_start:].max().item()
+      608              # Prefer _seq_lens_cpu (always available, updated during draft
+      609              # iterations) over seq_lens_cpu (None in async spec decode mode).
+     ...
+      615                  _seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
+      616              max_seq_lens = _seq_lens_cpu[reqs_start:].max().item()
+      617              self.prefill_ratio_to_sas_metadata["input_positions"] = input_positions
+      618 +            self.prefill_ratio_to_sas_metadata["input_positions_cpu"] = input_positions_cpu                                                                                                  
+      619              self.prefill_ratio_to_sas_metadata["max_query_len"] = max_query_len
+      620              self.prefill_ratio_to_sas_metadata["max_seq_lens"] = max_seq_lens
+      621  
+      622              prefill_query_start_loc = query_start_loc[reqs_start:] - query_start_loc[reqs_start]
+      623              prefill_input_positions = input_positions[tokens_start:]
+      624 +            prefill_input_positions_cpu = (                                                                                                                                                  
+      625 +                input_positions_cpu[tokens_start:]                                                                                                                                           
+      626 +                if input_positions_cpu is not None                                                                                                                                           
+      627 +                else None                                                                                                                                                                    
+      628 +            )                                                                                                                                                                                
+      629              self.prefill_ratio_to_sas_metadata["prefill_input_positions"] = prefill_input_positions
+      630 +            self.prefill_ratio_to_sas_metadata["prefill_input_positions_cpu"] = prefill_input_positions_cpu                                                                                  
+      631              self.prefill_ratio_to_sas_metadata["prefill_query_start_loc"] = prefill_query_start_loc
+      632  
+      633              cos, sin = get_cos_and_sin_dsa(prefill_input_positions)
+     ...
+      640              self.prefill_ratio_to_sas_metadata["num_prefill"] = num_prefill
+      641          else:
+      642              input_positions = self.prefill_ratio_to_sas_metadata["input_positions"]
+      643 +            input_positions_cpu = self.prefill_ratio_to_sas_metadata.get("input_positions_cpu")                                                                                              
+      644              max_query_len = self.prefill_ratio_to_sas_metadata["max_query_len"]
+      645              max_seq_lens = self.prefill_ratio_to_sas_metadata["max_seq_lens"]
+      646              prefill_input_positions = self.prefill_ratio_to_sas_metadata["prefill_input_positions"]
+      647 +            prefill_input_positions_cpu = self.prefill_ratio_to_sas_metadata.get("prefill_input_positions_cpu")                                                                              
+      648              prefill_query_start_loc = self.prefill_ratio_to_sas_metadata["prefill_query_start_loc"]
+      649              cos = self.prefill_ratio_to_sas_metadata["cos"]
+      650              sin = self.prefill_ratio_to_sas_metadata["sin"]
+
+⏺ 改 _get_padded_compressed_position，让它在 CPU 上算 mask/pad，再 D→D 拷到 NPU：
+
+⏺ Update(vllm_ascend/attention/dsa_v1.py)
+  ⎿  Added 15 lines, removed 2 lines
+      654          def _get_padded_compressed_position(prefill_input_positions, compress_ratio):
+      655              if compress_ratio <= 1:
+      656                  return prefill_input_positions
+      657 -            mask = ((prefill_input_positions + 1) % compress_ratio) == 0                                                                                                                     
+      658 -            input_positions = prefill_input_positions[mask]                                                                                                                                  
+      657 +            # Boolean indexing produces a dynamic-shape tensor; on NPU this                                                                                                                  
+      658 +            # forces a host sync to materialize the new length. Run on the CPU                                                                                                               
+      659 +            # mirror when available, then move the padded result to NPU                                                                                                                      
+      660 +            # non-blocking so downstream RoPE (get_cos_and_sin_dsa) keeps                                                                                                                    
+      661 +            # operating on device.                                                                                                                                                           
+      662 +            if prefill_input_positions_cpu is not None:                                                                                                                                      
+      663 +                source = prefill_input_positions_cpu                                                                                                                                         
+      664 +                target_device = prefill_input_positions.device                                                                                                                               
+      665 +            else:                                                                                                                                                                            
+      666 +                source = prefill_input_positions                                                                                                                                             
+      667 +                target_device = None                                                                                                                                                         
+      668 +            mask = ((source + 1) % compress_ratio) == 0                                                                                                                                      
+      669 +            input_positions = source[mask]                                                                                                                                                   
+      670              input_positions = (input_positions + 1) - compress_ratio
+      671              target_shape = (
+      672                  min(self.num_prefill_tokens, self.num_prefill_tokens // compress_ratio + self.num_prefills),
+      673              )
+      674              pad_right = target_shape[0] - input_positions.shape[0]
+      675              pad_positions = F.pad(input_positions, (0, pad_right), value=0.0)
+      676 +            if target_device is not None and pad_positions.device != target_device:                                                                                                          
+      677 +                pad_positions = pad_positions.pin_memory().to(target_device, non_blocking=True)                                                                                              
+      678              return pad_positions
+      679  
+      680          def _get_cmp_seq_lens(prefill_seq_lens, compress_ratio):
