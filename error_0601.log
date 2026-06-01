@@ -1,0 +1,15 @@
+Traceback (most recent call last):
+(Worker_DP2_TP3_EP11 pid=3774) ERROR 06-01 12:24:39 [multiproc_executor.py:962]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/vllm/v1/executor/multiproc_executor.py", line 957, in worker_busy_loop
+(Worker_DP2_TP3_EP11 pid=3774) ERROR 06-01 12:24:39 [multiproc_executor.py:962]     output = func(*args, **kwargs)
+(Worker_DP2_TP3_EP11 pid=3774) ERROR 06-01 12:24:39 [multiproc_executor.py:962]              ^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP2_TP3_EP11 pid=3774) ERROR 06-01 12:24:39 [multiproc_executor.py:962]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/vllm/v1/worker/worker_base.py", line 311, in initialize_from_config
+(Worker_DP2_TP3_EP11 pid=3774) ERROR 06-01 12:24:39 [multiproc_executor.py:962]     self.worker.initialize_from_config(kv_cache_config)  # type: ignore
+(Worker_DP2_TP3_EP11 pid=3774) ERROR 06-01 12:24:39 [multiproc_executor.py:962]     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP2_TP3_EP11 pid=3774) ERROR 06-01 12:24:39 [multiproc_executor.py:962]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/vllm_ascend/worker/worker.py", line 676, in initialize_from_config
+(Worker_DP2_TP3_EP11 pid=3774) ERROR 06-01 12:24:39 [multiproc_executor.py:962]     ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+(Worker_DP2_TP3_EP11 pid=3774) ERROR 06-01 12:24:39 [multiproc_executor.py:962]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/vllm/distributed/kv_transfer/kv_transfer_state.py", line 67, in ensure_kv_transfer_initialized
+(Worker_DP2_TP3_EP11 pid=3774) ERROR 06-01 12:24:39 [multiproc_executor.py:962]     _KV_CONNECTOR_AGENT = KVConnectorFactory.create_connector(
+(Worker_DP2_TP3_EP11 pid=3774) ERROR 06-01 12:24:39 [multiproc_executor.py:962]                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP2_TP3_EP11 pid=3774) ERROR 06-01 12:24:39 [multiproc_executor.py:962]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/vllm/distributed/kv_transfer/kv_connector/factory.py", line 59, in create_connector
+(Worker_DP2_TP3_EP11 pid=3774) ERROR 06-01 12:24:39 [multiproc_executor.py:962]     raise ValueError(
+(Worker_DP2_TP3_EP11 pid=3774) ERROR 06-01 12:24:39 [multiproc_executor.py:962] ValueError: Connector AscendMultiConnector does not support HMA but HMA is enabled. Please set `--disable-hybrid-kv-cache-manager`.
