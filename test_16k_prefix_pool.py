@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import time
@@ -7,7 +8,11 @@ BASE_URL = "http://127.0.0.1:8000"
 MODEL = "deepseek_v4"
 
 TARGET_TOKENS = 16640  # > 128 * 128 = 16384，留一点余量
-MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "1"))
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "128"))
+QUESTION = os.getenv(
+    "QUESTION",
+    "Question: What is 123 + 456? Answer with only the final number.",
+)
 
 
 def count_tokens(prompt: str) -> int:
@@ -39,32 +44,42 @@ def build_prompt() -> str:
         "This sentence is repeated to build a long deterministic prefix. "
     )
 
-    prompt = unit * 1000
-    n = count_tokens(prompt)
+    prefix = unit * 1000
+    n = count_tokens(prefix)
 
     while n < TARGET_TOKENS:
         need_ratio = TARGET_TOKENS / max(n, 1)
-        prompt += unit * max(100, int(100 * need_ratio))
-        n = count_tokens(prompt)
+        prefix += unit * max(100, int(100 * need_ratio))
+        n = count_tokens(prefix)
 
-    print(f"prompt tokens = {n}")
+    prompt = f"{prefix}\n\n{QUESTION}\n"
+    total_tokens = count_tokens(prompt)
+    print(f"prefix tokens = {n}")
+    print(f"prompt tokens = {total_tokens}")
+    print("question:")
+    print(QUESTION)
     return prompt
 
 
 def request_once(prompt: str, idx: int):
+    payload = {
+        "model": MODEL,
+        "prompt": prompt,
+        "max_tokens": MAX_OUTPUT_TOKENS,
+        "temperature": 0,
+    }
+    payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    payload_sha256 = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+
     t0 = time.time()
     resp = requests.post(
         f"{BASE_URL}/v1/completions",
-        json={
-            "model": MODEL,
-            "prompt": prompt,
-            "max_tokens": MAX_OUTPUT_TOKENS,
-            "temperature": 0,
-        },
+        json=payload,
         timeout=600,
     )
     latency = time.time() - t0
     print(f"request {idx}: status={resp.status_code}, latency={latency:.2f}s")
+    print(f"request {idx} payload sha256 = {payload_sha256}")
     print("full response:")
     try:
         data = resp.json()
@@ -72,7 +87,7 @@ def request_once(prompt: str, idx: int):
         for choice_idx, choice in enumerate(data.get("choices", [])):
             text = choice.get("text", "")
             output_tokens = tokenize(text) if text else []
-            print(f"request {idx} choice {choice_idx} output text:")
+            print(f"request {idx} choice {choice_idx} answer:")
             print(text)
             print(f"request {idx} choice {choice_idx} output token count = {len(output_tokens)}")
             print(f"request {idx} choice {choice_idx} output tokens:")
@@ -80,15 +95,18 @@ def request_once(prompt: str, idx: int):
     except ValueError:
         print(resp.text)
     resp.raise_for_status()
+    return payload_sha256
 
 
 if __name__ == "__main__":
     prompt = build_prompt()
 
     print("First request: should store KV into pool")
-    request_once(prompt, 1)
+    first_payload_sha256 = request_once(prompt, 1)
 
     time.sleep(2)
 
     print("Second request: should hit prefix/KV pool")
-    request_once(prompt, 2)
+    second_payload_sha256 = request_once(prompt, 2)
+
+    print(f"same request payload = {first_payload_sha256 == second_payload_sha256}")
