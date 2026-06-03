@@ -9,6 +9,8 @@ MODEL = "deepseek_v4"
 
 TARGET_TOKENS = 16640  # > 128 * 128 = 16384，留一点余量
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "128"))
+SEED = int(os.getenv("SEED", "0"))
+DISABLE_THINKING = os.getenv("DISABLE_THINKING", "1") != "0"
 QUESTION = os.getenv(
     "QUESTION",
     "Question: What is 123 + 456? Answer with only the final number.",
@@ -61,13 +63,40 @@ def build_prompt() -> str:
     return prompt
 
 
-def request_once(prompt: str, idx: int):
+def build_payload(prompt: str) -> dict:
     payload = {
         "model": MODEL,
         "prompt": prompt,
         "max_tokens": MAX_OUTPUT_TOKENS,
+        "min_tokens": 0,
+        "stream": False,
+        "n": 1,
+        "best_of": 1,
+        "seed": SEED,
         "temperature": 0,
+        "top_p": 1.0,
+        "top_k": 1,
+        "min_p": 0.0,
+        "frequency_penalty": 0.0,
+        "presence_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "ignore_eos": False,
     }
+
+    if DISABLE_THINKING:
+        payload.update(
+            {
+                "enable_thinking": False,
+                "thinking": {"type": "disabled"},
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+        )
+
+    return payload
+
+
+def request_once(prompt: str, idx: int):
+    payload = build_payload(prompt)
     payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     payload_sha256 = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
 
@@ -80,6 +109,8 @@ def request_once(prompt: str, idx: int):
     latency = time.time() - t0
     print(f"request {idx}: status={resp.status_code}, latency={latency:.2f}s")
     print(f"request {idx} payload sha256 = {payload_sha256}")
+    print(f"request {idx} deterministic seed = {SEED}")
+    print(f"request {idx} disable thinking = {DISABLE_THINKING}")
     print("full response:")
     try:
         data = resp.json()
