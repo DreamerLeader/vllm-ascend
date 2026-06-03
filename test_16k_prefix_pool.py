@@ -1,10 +1,13 @@
+import json
+import os
 import time
 import requests
 
-BASE_URL = "http://127.0.0.1:7777"
+BASE_URL = "http://127.0.0.1:8000"
 MODEL = "deepseek_v4"
 
 TARGET_TOKENS = 16640  # > 128 * 128 = 16384，留一点余量
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "1"))
 
 
 def count_tokens(prompt: str) -> int:
@@ -16,6 +19,17 @@ def count_tokens(prompt: str) -> int:
     resp.raise_for_status()
     data = resp.json()
     return len(data["tokens"])
+
+
+def tokenize(prompt: str) -> list[int]:
+    resp = requests.post(
+        f"{BASE_URL}/tokenize",
+        json={"model": MODEL, "prompt": prompt},
+        timeout=120,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["tokens"]
 
 
 def build_prompt() -> str:
@@ -44,14 +58,27 @@ def request_once(prompt: str, idx: int):
         json={
             "model": MODEL,
             "prompt": prompt,
-            "max_tokens": 1,
+            "max_tokens": MAX_OUTPUT_TOKENS,
             "temperature": 0,
         },
         timeout=600,
     )
     latency = time.time() - t0
     print(f"request {idx}: status={resp.status_code}, latency={latency:.2f}s")
-    print(resp.text[:500])
+    print("full response:")
+    try:
+        data = resp.json()
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        for choice_idx, choice in enumerate(data.get("choices", [])):
+            text = choice.get("text", "")
+            output_tokens = tokenize(text) if text else []
+            print(f"request {idx} choice {choice_idx} output text:")
+            print(text)
+            print(f"request {idx} choice {choice_idx} output token count = {len(output_tokens)}")
+            print(f"request {idx} choice {choice_idx} output tokens:")
+            print(output_tokens)
+    except ValueError:
+        print(resp.text)
     resp.raise_for_status()
 
 
