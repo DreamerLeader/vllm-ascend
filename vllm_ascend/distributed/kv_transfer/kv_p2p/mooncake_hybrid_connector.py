@@ -1117,6 +1117,16 @@ class MooncakeConnectorScheduler:
         h(N-1) instead of h(N). The decoder recomputes the last token to
         derive h(N) correctly.
 
+        NOTE: This function is intentionally NOT called in the current
+        ``get_num_new_matched_tokens``. When the P node generates the first
+        token in PD mode (do_remote_decode), truncation removes the last
+        prompt token, which may be the ``<thinking_trigger>`` added by the
+        chat template. Removing it causes the model to skip thinking and
+        output content directly. The fix is to skip truncation on the P side
+        and subtract 1 from prompt_token_ids on the D side (accounting for
+        the P node's appended first token). This function is retained as a
+        reference for the original community PD design.
+
         Guarded by ``_p_side_truncated`` to avoid repeated truncation if the
         request is preempted and rescheduled."""
         params = request.kv_transfer_params
@@ -1179,14 +1189,16 @@ class MooncakeConnectorScheduler:
 
         if params is not None and params.get("do_remote_prefill"):
             # Remote prefill: get all prompt blocks from remote.
-            token_ids = request.prompt_token_ids or []
-            actual = self._state_prefill_token_count(len(token_ids))
-            count = actual - num_computed_tokens
+            # P appends the first output token to prompt_token_ids,
+            # subtract 1 to get the original prompt length.
+            num_original_prompt_tokens = len(request.prompt_token_ids or []) - 1
+            count = max(num_original_prompt_tokens - num_computed_tokens, 0)
             if count > 0:
                 return count, True
 
-        if params is not None and params.get("do_remote_decode") and self.need_truncate:
-            self._truncate_request_for_prefill(request)
+        # NOTE: _truncate_request_for_prefill intentionally NOT called here.
+        # P keeps all prompt tokens including <thinking_trigger>.
+        # D subtracts 1 from prompt_token_ids (accounting for P's first token).
 
         # No remote prefill for this request.
         return 0, False
