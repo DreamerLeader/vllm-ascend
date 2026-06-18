@@ -1,0 +1,3 @@
+name,yaml/path,link,status,vLLM Git information,vLLM-Ascend Git information,time
+test_custom_op_multi_card,tests/e2e/nightly/single_node/ops/multicard_ops_a2/,https://github.com/vllm-project/vllm-ascend/actions/runs/27571160772/job/81510428501,success,ad7125a431e176d4161099480a66f0169609a690,f4824036f0cedac5732f404b686aba140a634a9e,2026-06-16 03:47:01 +08:00
+Qwen3.5-397B-A17B-w4a8-mtp,tests/e2e/nightly/single_node/models/configs/Qwen3.5-397B-A17B-w4a8-mtp-A2.yaml,https://github.com/vllm-project/vllm-ascend/actions/runs/27571160772/job/81510428460,failure,ad7125a431e176d4161099480a66f0169609a690,f4824036f0cedac5732f404b686aba140a634a9e,2026-06-16 03:46:51 +08:00
