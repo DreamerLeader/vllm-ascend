@@ -6,6 +6,7 @@ from vllm.distributed.parallel_state import GroupCoordinator
 
 from tests.ut.attention.utils import patch_distributed_groups
 from tests.ut.base import TestBase
+from vllm_ascend.ascend_config import init_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
 if "torch_npu._inductor" not in sys.modules:
@@ -90,12 +91,16 @@ class TestAscendSFAMetadataBuilder(TestBase):
         self.mock_cfg.parallel_config.tensor_parallel_size = 1
         self.mock_cfg.parallel_config.prefill_context_parallel_size = 1
         self.mock_cfg.parallel_config.decode_context_parallel_size = 1
+        self.mock_cfg.parallel_config.enable_expert_parallel = False
 
         self.mock_cfg.compilation_config = MagicMock()
         self.mock_cfg.compilation_config.pass_config = MagicMock()
         self.mock_cfg.compilation_config.pass_config.enable_sp = False
 
+        self.mock_cfg.additional_config = {"refresh": True}
+        self.mock_cfg.kv_transfer_config = None
         self.mock_cfg.speculative_config.num_speculative_tokens = 0
+        init_ascend_config(self.mock_cfg)
 
         self.patcher = patch("vllm.config.get_current_vllm_config", return_value=self.mock_cfg)
         self.patcher.start()

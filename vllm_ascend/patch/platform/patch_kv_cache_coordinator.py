@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM projectx
 import sys
+from collections.abc import Mapping
 from math import lcm
 
 import vllm
@@ -17,7 +18,7 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
 )
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec, MambaSpec
 
 from vllm_ascend.core.single_type_kv_cache_manager import get_manager_for_kv_cache_spec
 from vllm_ascend.patch.platform.patch_prefix_cache_retention import (
@@ -25,6 +26,35 @@ from vllm_ascend.patch.platform.patch_prefix_cache_retention import (
 )
 
 USE_MULTI_GROUPS_KV_CACHE = True
+
+_ORIG_GET_COORDINATOR_ATTR = "_ascend_orig_get_kv_cache_coordinator"
+if not hasattr(vllm.v1.core.kv_cache_coordinator, _ORIG_GET_COORDINATOR_ATTR):
+    setattr(
+        vllm.v1.core.kv_cache_coordinator,
+        _ORIG_GET_COORDINATOR_ATTR,
+        vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator,
+    )
+_orig_get_kv_cache_coordinator = getattr(vllm.v1.core.kv_cache_coordinator, _ORIG_GET_COORDINATOR_ATTR)
+
+
+def _is_deepseek_v4_kv_cache_spec(kv_cache_spec: KVCacheSpec) -> bool:
+    if getattr(kv_cache_spec, "model_version", None) == "deepseek_v4":
+        return True
+
+    nested_specs = getattr(kv_cache_spec, "kv_cache_specs", None)
+    if nested_specs is None:
+        return False
+
+    if isinstance(nested_specs, Mapping):
+        nested_specs = nested_specs.values()
+    elif not isinstance(nested_specs, (list, tuple, set)):
+        return False
+
+    return any(getattr(spec, "model_version", None) == "deepseek_v4" for spec in nested_specs)
+
+
+def _is_deepseek_v4_kv_cache_config(kv_cache_config: KVCacheConfig) -> bool:
+    return any(_is_deepseek_v4_kv_cache_spec(group.kv_cache_spec) for group in kv_cache_config.kv_cache_groups)
 
 
 def _compress_ratio(kv_cache_spec: KVCacheSpec) -> int:
@@ -60,6 +90,8 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
+        self.dcp_world_size = dcp_world_size
+        self.pcp_world_size = pcp_world_size
         # Fall back to `max_model_len` when unset so the recycling-aware
         # admission cap (vLLM PR #40946) collapses to the prior uncapped
         # behavior. The scheduler always supplies the real value at runtime.
@@ -205,9 +237,12 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         """
 
         def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
-            if kv_cache_spec.block_size == self.hash_block_size:
+            target_block_size = kv_cache_spec.block_size
+            if not isinstance(kv_cache_spec, MambaSpec) and self.dcp_world_size * self.pcp_world_size > 1:
+                target_block_size *= self.dcp_world_size * self.pcp_world_size
+            if target_block_size == self.hash_block_size:
                 return block_hashes
-            return BlockHashListWithBlockSize(block_hashes, self.hash_block_size, kv_cache_spec.block_size)
+            return BlockHashListWithBlockSize(block_hashes, self.hash_block_size, target_block_size)
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         hit_length = max_cache_hit_length
@@ -292,6 +327,21 @@ def get_kv_cache_coordinator(
     eagle_attn_layer_names: list[str] | None = None,
     metrics_collector: KVCacheMetricsCollector | None = None,
 ) -> KVCacheCoordinator:
+    if not _is_deepseek_v4_kv_cache_config(kv_cache_config):
+        return _orig_get_kv_cache_coordinator(
+            kv_cache_config=kv_cache_config,
+            max_model_len=max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
+            use_eagle=use_eagle,
+            enable_caching=enable_caching,
+            enable_kv_cache_events=enable_kv_cache_events,
+            dcp_world_size=dcp_world_size,
+            pcp_world_size=pcp_world_size,
+            hash_block_size=hash_block_size,
+            eagle_attn_layer_names=eagle_attn_layer_names,
+            metrics_collector=metrics_collector,
+        )
+
     return AscendHybridKVCacheCoordinator(
         kv_cache_config,
         max_model_len,
