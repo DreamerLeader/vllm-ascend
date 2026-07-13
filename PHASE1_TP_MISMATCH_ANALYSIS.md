@@ -225,3 +225,126 @@ mooncake master 累计指标（19:56 快照）是双向闭环的铁证：
 
 单测：`pytest tests/ut/distributed/ascend_store/ -k mismatch` → 18 passed
 （含 mismatch 的全量 250 passed）。E2E 见 `PHASE1_CHANGELOG.md`。
+run_prefill.sh：
+```shell
+#!/bin/bash
+# Prefill node: tp4 dp1, cards 0-3, MultiConnector kv_producer
+# AscendStore peer = decode(tp2) -> decode_tp_size=2
+set -e
+export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:$LD_LIBRARY_PATH
+export PYTHONPATH=$PYTHONPATH:/vllm-workspace/vllm
+export PYTHONHASHSEED=0
+export MOONCAKE_CONFIG_PATH="/workspace/pd_run/mooncake.json"
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+export ACL_OP_INIT_MODE=1
+# A2 (HCCS-only) buffer path
+export ASCEND_BUFFER_POOL=4:8
+export HCCL_RDMA_TIMEOUT=17
+export ASCEND_CONNECT_TIMEOUT=10000
+export ASCEND_TRANSFER_TIMEOUT=10000
+export VLLM_USE_V1=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+
+python3 -m vllm.entrypoints.openai.api_server \
+    --model /workspace/Qwen3-8B \
+    --port 8100 \
+    --trust-remote-code \
+    --enforce-eager \
+    --no-enable-prefix-caching \
+    --tensor-parallel-size 4 \
+    --data-parallel-size 1 \
+    --max-model-len 4096 \
+    --block-size 128 \
+    --max-num-batched-tokens 4096 \
+    --gpu-memory-utilization 0.8 \
+    --kv-transfer-config \
+'{
+  "kv_connector": "MultiConnector",
+  "kv_role": "kv_producer",
+  "kv_load_failure_policy": "recompute",
+  "kv_connector_extra_config": {
+    "connectors": [
+      {
+        "kv_connector": "MooncakeConnectorV1",
+        "kv_role": "kv_producer",
+        "kv_port": "20001",
+        "kv_connector_extra_config": {
+          "prefill": {"dp_size": 1, "tp_size": 4},
+          "decode": {"dp_size": 1, "tp_size": 2}
+        }
+      },
+      {
+        "kv_connector": "AscendStoreConnector",
+        "kv_role": "kv_producer",
+        "kv_connector_extra_config": {
+          "lookup_rpc_port": "0",
+          "backend": "mooncake",
+          "decode_tp_size": 2
+        }
+      }
+    ]
+  }
+}'
+```
+run_decode.sh:
+```shell
+#!/bin/bash
+# Decode node: tp2 dp1, cards 6-7, MultiConnector kv_consumer + consumer_is_to_put
+# AscendStore peer = prefill(tp4) -> prefill_tp_size=4 ; decode stores KV to pool
+set -e
+export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:$LD_LIBRARY_PATH
+export PYTHONPATH=$PYTHONPATH:/vllm-workspace/vllm
+export PYTHONHASHSEED=0
+export MOONCAKE_CONFIG_PATH="/workspace/pd_run/mooncake.json"
+export ASCEND_RT_VISIBLE_DEVICES=6,7
+export ACL_OP_INIT_MODE=1
+export ASCEND_BUFFER_POOL=4:8
+export HCCL_RDMA_TIMEOUT=17
+export ASCEND_CONNECT_TIMEOUT=10000
+export ASCEND_TRANSFER_TIMEOUT=10000
+export VLLM_USE_V1=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+
+python3 -m vllm.entrypoints.openai.api_server \
+    --model /workspace/Qwen3-8B \
+    --port 8200 \
+    --trust-remote-code \
+    --enforce-eager \
+    --no-enable-prefix-caching \
+    --tensor-parallel-size 2 \
+    --data-parallel-size 1 \
+    --max-model-len 4096 \
+    --block-size 128 \
+    --max-num-batched-tokens 4096 \
+    --gpu-memory-utilization 0.8 \
+    --kv-transfer-config \
+'{
+  "kv_connector": "MultiConnector",
+  "kv_role": "kv_consumer",
+  "kv_load_failure_policy": "recompute",
+  "kv_connector_extra_config": {
+    "connectors": [
+      {
+        "kv_connector": "MooncakeConnectorV1",
+        "kv_role": "kv_consumer",
+        "kv_port": "20002",
+        "kv_connector_extra_config": {
+          "prefill": {"dp_size": 1, "tp_size": 4},
+          "decode": {"dp_size": 1, "tp_size": 2}
+        }
+      },
+      {
+        "kv_connector": "AscendStoreConnector",
+        "kv_role": "kv_consumer",
+        "kv_connector_extra_config": {
+          "lookup_rpc_port": "1",
+          "backend": "mooncake",
+          "prefill_tp_size": 4,
+          "consumer_is_to_put": true
+        }
+      }
+    ]
+  }
+}'
+```
+
