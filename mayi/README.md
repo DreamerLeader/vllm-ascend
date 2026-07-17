@@ -200,7 +200,7 @@ curl -s http://localhost:8000/v1/completions -H "Content-Type: application/json"
 "max_tokens": 256
 }'
 ```
-
+sk-ws-H.EDPYLMI.IqUW.MEQCIAbGU3gGnlWTflLZIoM94V0x5UwqxNxnBby8fnGX5I6gAiBfnGsjeeY-R9VVkDYGcHzLI5K1pzpYK8hwu6KG12zy6w
 
 
 
